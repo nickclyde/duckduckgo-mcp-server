@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/nickclyde-duckduckgo-mcp-server-badge.png)](https://mseep.ai/app/nickclyde-duckduckgo-mcp-server)
+
 # DuckDuckGo Search MCP Server
 
 [![smithery badge](https://smithery.ai/badge/@nickclyde/duckduckgo-mcp-server)](https://smithery.ai/server/@nickclyde/duckduckgo-mcp-server)
