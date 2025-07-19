@@ -58,6 +58,31 @@ Add the following configuration:
 
 3. Restart Claude Desktop
 
+### On your network 
+Change the following lines in ```src/duckduckgo_mcp_server/server.py```
+   ```
+   mcp = FastMCP("ddg-search")
+   ```
+   To
+   ```
+   mcp = FastMCP("ddg-search", host="0.0.0.0", port=8080)
+   ```
+  And 
+  ```
+  mcp.run()
+  ```
+  To
+  ```
+  mcp.run(transport="streamable-http")
+  ```
+
+   When you launch server.py the MCP server will be available at ```http://0.0.0.0:8080/mcp/```
+
+   **Important note: when providing your mcp server URL to third party services include trainling slash at the end of your url:**
+   ```
+   https://your_domain.com/mcp/
+   ```
+   **Otherwise, you may encounter issues.**
 ### Development
 
 For local development, you can use the MCP CLI:
