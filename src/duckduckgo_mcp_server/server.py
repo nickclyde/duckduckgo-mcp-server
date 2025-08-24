@@ -64,6 +64,12 @@ class DuckDuckGoSearcher:
             output.append(f"   Summary: {result.snippet}")
             output.append("")  # Empty line between results
 
+        output.append(
+            "If any of the search results are relevant, ALWAYS use `fetch_content` to retrieve the full content of the page using the `URL`." \
+            " The `summary` is just a brief snippet and can have missing information." \
+            " If not, try to search again using a more canonical term, or search for a different term that is more likely to contain the relevant information."
+        )
+
         return "\n".join(output)
 
     async def search(
