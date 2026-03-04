@@ -1,6 +1,7 @@
 # DuckDuckGo Search MCP Server
 
 [![smithery badge](https://smithery.ai/badge/@nickclyde/duckduckgo-mcp-server)](https://smithery.ai/server/@nickclyde/duckduckgo-mcp-server)
+[![MCP Shield](https://img.shields.io/badge/MCP_Shield-A%2B_(97)-brightgreen)](https://github.com/thuggeelya/mcp-shield)
 
 A Model Context Protocol (MCP) server that provides web search capabilities through DuckDuckGo, with additional features for content fetching and parsing.
 
