@@ -4,6 +4,7 @@
 [![PyPI downloads](https://img.shields.io/pypi/dm/duckduckgo-mcp-server)](https://pypi.org/project/duckduckgo-mcp-server/)
 [![Python versions](https://img.shields.io/pypi/pyversions/duckduckgo-mcp-server)](https://pypi.org/project/duckduckgo-mcp-server/)
 
+[![AgentRank](https://agentrank-ai.com/api/badge/tool/nickclyde--duckduckgo-mcp-server)](https://agentrank-ai.com/tool/nickclyde--duckduckgo-mcp-server/)
 A Model Context Protocol (MCP) server that provides web search capabilities through DuckDuckGo, with additional features for content fetching and parsing.
 
 ## Quick Start
