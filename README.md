@@ -6,6 +6,10 @@
 
 A Model Context Protocol (MCP) server that provides web search capabilities through DuckDuckGo, with additional features for content fetching and parsing.
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/nickclyde-duckduckgo-mcp-server).
+
 ## Quick Start
 
 ```bash
