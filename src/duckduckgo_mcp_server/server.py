@@ -15,7 +15,7 @@ import os
 from enum import Enum
 
 try:
-    from tavily import TavilyClient
+    from tavily import AsyncTavilyClient
     TAVILY_AVAILABLE = True
 except ImportError:
     TAVILY_AVAILABLE = False
@@ -187,7 +187,7 @@ class TavilySearcher:
     """Search provider using Tavily API."""
 
     def __init__(self, api_key: str):
-        self.client = TavilyClient(api_key=api_key)
+        self.client = AsyncTavilyClient(api_key=api_key)
         self.rate_limiter = RateLimiter()
 
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
@@ -215,7 +215,7 @@ class TavilySearcher:
 
             await ctx.info(f"Searching Tavily for: {query}")
 
-            response = self.client.search(
+            response = await self.client.search(
                 query=query,
                 max_results=max_results,
                 search_depth="basic",
@@ -351,7 +351,7 @@ else:
 fetcher = WebContentFetcher()
 
 provider_name = "Tavily" if isinstance(searcher, TavilySearcher) else "DuckDuckGo"
-print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
+print(f"Search MCP Server initialized:", file=sys.stderr)
 print(f"  Search Provider: {provider_name}", file=sys.stderr)
 if isinstance(searcher, DuckDuckGoSearcher):
     print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)

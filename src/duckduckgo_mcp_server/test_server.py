@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import os
 import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -12,6 +14,7 @@ import duckduckgo_mcp_server.server
 from duckduckgo_mcp_server.server import (
     RateLimiter,
     DuckDuckGoSearcher,
+    TavilySearcher,
     SafeSearchMode,
     SearchResult,
     WebContentFetcher,
@@ -399,3 +402,106 @@ class TestConfiguration(unittest.TestCase):
         call_kwargs = mock_client.post.call_args
         post_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
         self.assertEqual(post_data["kl"], "us-en")
+
+
+class TestTavilySearcher(unittest.TestCase):
+    def _make_searcher(self):
+        with patch("tavily.AsyncTavilyClient"):
+            searcher = TavilySearcher(api_key="test-key")
+        return searcher
+
+    def test_results_mapped_correctly(self):
+        searcher = self._make_searcher()
+        ctx = DummyCtx()
+
+        mock_response = {
+            "results": [
+                {"title": "First", "url": "https://first.com", "content": "Snippet 1"},
+                {"title": "Second", "url": "https://second.com", "content": "Snippet 2"},
+            ]
+        }
+        searcher.client.search = AsyncMock(return_value=mock_response)
+
+        results = asyncio.run(searcher.search("test query", ctx, max_results=10))
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].title, "First")
+        self.assertEqual(results[0].link, "https://first.com")
+        self.assertEqual(results[0].snippet, "Snippet 1")
+        self.assertEqual(results[0].position, 1)
+        self.assertEqual(results[1].title, "Second")
+        self.assertEqual(results[1].position, 2)
+
+    def test_empty_results(self):
+        searcher = self._make_searcher()
+        ctx = DummyCtx()
+
+        searcher.client.search = AsyncMock(return_value={"results": []})
+
+        results = asyncio.run(searcher.search("empty query", ctx))
+
+        self.assertEqual(results, [])
+
+    def test_api_error_returns_empty(self):
+        searcher = self._make_searcher()
+        ctx = DummyCtx()
+
+        searcher.client.search = AsyncMock(side_effect=Exception("API error"))
+
+        results = asyncio.run(searcher.search("bad query", ctx))
+
+        self.assertEqual(results, [])
+
+    def test_format_results_for_llm(self):
+        searcher = self._make_searcher()
+        results = [
+            SearchResult(title="Result", link="https://example.com", snippet="A snippet", position=1),
+        ]
+
+        formatted = searcher.format_results_for_llm(results)
+
+        self.assertIn("Found 1 search results", formatted)
+        self.assertIn("1. Result", formatted)
+        self.assertIn("URL: https://example.com", formatted)
+
+    def test_format_results_for_llm_empty(self):
+        searcher = self._make_searcher()
+
+        formatted = searcher.format_results_for_llm([])
+
+        self.assertIn("No results were found", formatted)
+
+    def test_respects_max_results(self):
+        searcher = self._make_searcher()
+        ctx = DummyCtx()
+
+        mock_response = {
+            "results": [
+                {"title": f"R{i}", "url": f"https://r{i}.com", "content": f"S{i}"}
+                for i in range(10)
+            ]
+        }
+        searcher.client.search = AsyncMock(return_value=mock_response)
+
+        results = asyncio.run(searcher.search("test", ctx, max_results=3))
+
+        self.assertEqual(len(results), 3)
+
+
+class TestProviderSelection(unittest.TestCase):
+    def test_provider_tavily_with_key(self):
+        env = {"SEARCH_PROVIDER": "tavily", "TAVILY_API_KEY": "test-key"}
+        with patch.dict(os.environ, env, clear=False):
+            importlib.reload(duckduckgo_mcp_server.server)
+            self.assertEqual(type(duckduckgo_mcp_server.server.searcher).__name__, "TavilySearcher")
+
+    def test_provider_duckduckgo_explicit(self):
+        env = {"SEARCH_PROVIDER": "duckduckgo"}
+        with patch.dict(os.environ, env, clear=False):
+            importlib.reload(duckduckgo_mcp_server.server)
+            self.assertEqual(type(duckduckgo_mcp_server.server.searcher).__name__, "DuckDuckGoSearcher")
+
+    def test_provider_auto_without_tavily_key(self):
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "", "SEARCH_PROVIDER": "auto"}, clear=False):
+            importlib.reload(duckduckgo_mcp_server.server)
+            self.assertEqual(type(duckduckgo_mcp_server.server.searcher).__name__, "DuckDuckGoSearcher")
