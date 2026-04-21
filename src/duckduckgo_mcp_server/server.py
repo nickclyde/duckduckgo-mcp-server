@@ -231,8 +231,6 @@ class TavilySearcher:
                         position=i,
                     )
                 )
-                if len(results) >= max_results:
-                    break
 
             await ctx.info(f"Successfully found {len(results)} results via Tavily")
             return results

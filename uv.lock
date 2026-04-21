@@ -363,6 +363,7 @@ dev = [
     { name = "anyio" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "tavily-python" },
 ]
 
 [package.metadata]
@@ -380,6 +381,7 @@ dev = [
     { name = "anyio", specifier = ">=4.0" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest-asyncio", specifier = ">=0.25.0" },
+    { name = "tavily-python", specifier = ">=0.5" },
 ]
 
 [[package]]

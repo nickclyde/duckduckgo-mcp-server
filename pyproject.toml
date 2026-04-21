@@ -37,4 +37,5 @@ dev = [
     "anyio>=4.0",
     "pytest>=9.0.2",
     "pytest-asyncio>=0.25.0",
+    "tavily-python>=0.5",
 ]

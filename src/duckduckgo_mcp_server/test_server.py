@@ -406,7 +406,7 @@ class TestConfiguration(unittest.TestCase):
 
 class TestTavilySearcher(unittest.TestCase):
     def _make_searcher(self):
-        with patch("tavily.AsyncTavilyClient"):
+        with patch("duckduckgo_mcp_server.server.AsyncTavilyClient"):
             searcher = TavilySearcher(api_key="test-key")
         return searcher
 
@@ -475,10 +475,11 @@ class TestTavilySearcher(unittest.TestCase):
         searcher = self._make_searcher()
         ctx = DummyCtx()
 
+        # Tavily API respects max_results, so mock returns only 3 results
         mock_response = {
             "results": [
                 {"title": f"R{i}", "url": f"https://r{i}.com", "content": f"S{i}"}
-                for i in range(10)
+                for i in range(3)
             ]
         }
         searcher.client.search = AsyncMock(return_value=mock_response)
@@ -486,6 +487,10 @@ class TestTavilySearcher(unittest.TestCase):
         results = asyncio.run(searcher.search("test", ctx, max_results=3))
 
         self.assertEqual(len(results), 3)
+        # Verify max_results was passed to the Tavily API
+        searcher.client.search.assert_called_once_with(
+            query="test", max_results=3, search_depth="basic"
+        )
 
 
 class TestProviderSelection(unittest.TestCase):
