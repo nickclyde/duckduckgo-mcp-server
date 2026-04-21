@@ -14,6 +14,12 @@ import re
 import os
 from enum import Enum
 
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
+
 
 class SafeSearchMode(Enum):
     """DuckDuckGo SafeSearch modes"""
@@ -177,6 +183,66 @@ class DuckDuckGoSearcher:
             return []
 
 
+class TavilySearcher:
+    """Search provider using Tavily API."""
+
+    def __init__(self, api_key: str):
+        self.client = TavilyClient(api_key=api_key)
+        self.rate_limiter = RateLimiter()
+
+    def format_results_for_llm(self, results: List[SearchResult]) -> str:
+        """Format results in a natural language style that's easier for LLMs to process"""
+        if not results:
+            return "No results were found for your search query. Please try rephrasing your search or try again."
+
+        output = []
+        output.append(f"Found {len(results)} search results:\n")
+
+        for result in results:
+            output.append(f"{result.position}. {result.title}")
+            output.append(f"   URL: {result.link}")
+            output.append(f"   Summary: {result.snippet}")
+            output.append("")
+
+        return "\n".join(output)
+
+    async def search(
+        self, query: str, ctx: Context, max_results: int = 10, region: str = ""
+    ) -> List[SearchResult]:
+        """Search using Tavily API."""
+        try:
+            await self.rate_limiter.acquire()
+
+            await ctx.info(f"Searching Tavily for: {query}")
+
+            response = self.client.search(
+                query=query,
+                max_results=max_results,
+                search_depth="basic",
+            )
+
+            results = []
+            for i, item in enumerate(response.get("results", []), start=1):
+                results.append(
+                    SearchResult(
+                        title=item.get("title", ""),
+                        link=item.get("url", ""),
+                        snippet=item.get("content", ""),
+                        position=i,
+                    )
+                )
+                if len(results) >= max_results:
+                    break
+
+            await ctx.info(f"Successfully found {len(results)} results via Tavily")
+            return results
+
+        except Exception as e:
+            await ctx.error(f"Tavily search error: {str(e)}")
+            traceback.print_exc(file=sys.stderr)
+            return []
+
+
 class WebContentFetcher:
     def __init__(self):
         self.rate_limiter = RateLimiter(requests_per_minute=20)
@@ -252,6 +318,8 @@ mcp = FastMCP("ddg-search")
 # Read configuration from environment variables
 SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "auto").lower()
 
 # Validate and set SafeSearch mode
 try:
@@ -260,22 +328,44 @@ except KeyError:
     print(f"Warning: Invalid DDG_SAFE_SEARCH value '{SAFE_SEARCH_MODE}', using MODERATE", file=sys.stderr)
     safe_search = SafeSearchMode.MODERATE
 
-searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+# Select search provider based on configuration
+if SEARCH_PROVIDER == "tavily":
+    if not TAVILY_AVAILABLE:
+        print("Warning: tavily-python not installed. Install with: pip install 'duckduckgo-mcp-server[tavily]'", file=sys.stderr)
+        print("Falling back to DuckDuckGo.", file=sys.stderr)
+        searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+    elif not TAVILY_API_KEY:
+        print("Warning: SEARCH_PROVIDER=tavily but TAVILY_API_KEY not set. Falling back to DuckDuckGo.", file=sys.stderr)
+        searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+    else:
+        searcher = TavilySearcher(api_key=TAVILY_API_KEY)
+elif SEARCH_PROVIDER == "duckduckgo":
+    searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+else:
+    # auto: use Tavily if available and configured, otherwise DuckDuckGo
+    if TAVILY_AVAILABLE and TAVILY_API_KEY:
+        searcher = TavilySearcher(api_key=TAVILY_API_KEY)
+    else:
+        searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+
 fetcher = WebContentFetcher()
 
+provider_name = "Tavily" if isinstance(searcher, TavilySearcher) else "DuckDuckGo"
 print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
-print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
-print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
+print(f"  Search Provider: {provider_name}", file=sys.stderr)
+if isinstance(searcher, DuckDuckGoSearcher):
+    print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
+    print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
 
 
 @mcp.tool()
 async def search(query: str, ctx: Context, max_results: int = 10, region: str = "") -> str:
-    """Search the web using DuckDuckGo. Returns a list of results with titles, URLs, and snippets. Use this to find current information, research topics, or locate specific websites. For best results, use specific and descriptive search queries.
+    """Search the web using DuckDuckGo or Tavily (configurable via SEARCH_PROVIDER env var). Returns a list of results with titles, URLs, and snippets. Use this to find current information, research topics, or locate specific websites. For best results, use specific and descriptive search queries.
 
     Args:
         query: The search query string. Be specific for better results (e.g., 'Python asyncio tutorial' rather than 'Python').
         max_results: Maximum number of results to return, between 1 and 20 (default: 10).
-        region: Optional region/language code to localize results. Examples: 'us-en' (USA/English), 'uk-en' (UK/English), 'de-de' (Germany/German), 'fr-fr' (France/French), 'jp-ja' (Japan/Japanese), 'cn-zh' (China/Chinese), 'wt-wt' (no region). Leave empty to use the server default.
+        region: Optional region/language code to localize results (DuckDuckGo only). Examples: 'us-en' (USA/English), 'uk-en' (UK/English), 'de-de' (Germany/German), 'fr-fr' (France/French), 'jp-ja' (Japan/Japanese), 'cn-zh' (China/Chinese), 'wt-wt' (no region). Leave empty to use the server default.
         ctx: MCP context for logging.
     """
     try:

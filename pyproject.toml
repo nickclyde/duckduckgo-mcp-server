@@ -18,6 +18,9 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 
+[project.optional-dependencies]
+tavily = ["tavily-python>=0.5"]
+
 [project.urls]
 Homepage = "https://github.com/nickclyde/duckduckgo-mcp-server"
 Issues = "https://github.com/nickclyde/duckduckgo-mcp-server/issues"
