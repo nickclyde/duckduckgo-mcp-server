@@ -307,8 +307,19 @@ def main():
         default="stdio",
         help="Transport protocol to use (default: stdio)",
     )
+
+    parser.add_argument("--host", help="Host to bind to")
+    parser.add_argument("--port", type=int, help="Port to bind to")
+
     args = parser.parse_args()
-    mcp.run(transport=args.transport)
+
+    if args.transport == "stdio" and (args.host is not None or args.port is not None):
+        parser.error("The transport `stdio` does not allow --host or --port flags.")
+
+    if args.transport in ("sse", "streamable-http"):
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    else:
+        mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":

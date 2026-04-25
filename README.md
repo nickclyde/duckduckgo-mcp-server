@@ -99,7 +99,9 @@ uvx duckduckgo-mcp-server --transport sse
 uvx duckduckgo-mcp-server --transport streamable-http
 ```
 
-The default transport is `stdio`, which is used by Claude Desktop and Claude Code.
+You may also pass an explicit host and port for the server to listen on via the `--host` and `--port` argument flags. If these flags are passed to the server when the specified transport is `stdio`, the server will fail to start.
+
+The default transport is `stdio`, which is used by Claude Desktop and Claude Code. 
 
 ### Development
 
