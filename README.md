@@ -270,3 +270,7 @@ Issues and pull requests are welcome! Some areas for potential improvement:
 ## License
 
 This project is licensed under the MIT License.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=nickclyde/duckduckgo-mcp-server&type=Date)](https://star-history.com/#nickclyde/duckduckgo-mcp-server&Date)
