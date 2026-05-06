@@ -497,38 +497,48 @@ def main():
                 http_handler = route.endpoint
                 break
 
-        # Create a combined routes list
+        # Create a combined routes list with proper deduplication
         combined_routes: list[BaseRoute] = []
+        added_routes: set[tuple[str, tuple[str, ...]]] = set()
+
+        def _route_key(route: Route) -> tuple[str, tuple[str, ...]]:
+            methods = tuple(sorted(route.methods or ["GET"]))
+            return (route.path, methods)
 
         # 1. Compatibility route: POST /sse -> StreamableHTTP (for llama.cpp etc.)
         if http_handler:
-            combined_routes.append(
-                Route(mcp.settings.sse_path, http_handler, methods=["POST"])
+            compat_route = Route(
+                mcp.settings.sse_path, http_handler, methods=["POST"]
             )
+            key = _route_key(compat_route)
+            combined_routes.append(compat_route)
+            added_routes.add(key)
             print(
                 f"Added POST support to {mcp.settings.sse_path} for Streamable HTTP compatibility"
             )
 
-        # 2. Regular routes
-        if "sse" in transports:
-            combined_routes.extend(sse_app.routes)
-
-        if "streamable-http" in transports:
-            for route in http_app.routes:
+        # 2. Regular routes (dedupe by (path, methods))
+        for app_routes in [
+            sse_app.routes if "sse" in transports else [],
+            http_app.routes if "streamable-http" in transports else [],
+        ]:
+            for route in app_routes:
                 if isinstance(route, Route):
-                    if not any(
-                        isinstance(r, Route) and r.path == route.path
-                        for r in combined_routes
-                    ):
+                    key = _route_key(route)
+                    if key not in added_routes:
                         combined_routes.append(route)
+                        added_routes.add(key)
                 else:
                     combined_routes.append(route)
 
         # Create the Starlette app with combined routes
-        app = Starlette(
-            routes=combined_routes,
-            lifespan=http_app.router.lifespan_context,
+        # Prefer http_app lifespan if available (it has more complete lifecycle)
+        lifespan = (
+            http_app.router.lifespan_context
+            if "streamable-http" in transports
+            else sse_app.router.lifespan_context
         )
+        app = Starlette(routes=combined_routes, lifespan=lifespan)
 
         # Add CORS middleware
         app.add_middleware(
@@ -555,7 +565,8 @@ def main():
         uvicorn.run(app, host=args.host, port=args.port)
     else:
         print(
-            f"Error: Invalid transport combination: {transports}",
+            f"Error: Invalid transport combination: {transports}. "
+            "Valid options: stdio | sse | streamable-http | sse streamable-http",
             file=sys.stderr,
         )
         sys.exit(1)
