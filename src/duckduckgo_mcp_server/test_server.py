@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import sys
 import threading
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import unittest
 
 import httpx
+from starlette.routing import Route as StarletteRoute
 
 import duckduckgo_mcp_server.server
 
@@ -534,6 +536,24 @@ class TestWebContentFetcherAutoFallback(unittest.TestCase):
         self.assertTrue(result.startswith("Error"))
 
 
+def _setup_mock_mcp_for_http(mock_mcp):
+    mock_mcp.settings.host = "127.0.0.1"
+    mock_mcp.settings.port = 8000
+    mock_mcp.settings.sse_path = "/sse"
+    mock_mcp.settings.streamable_http_path = "/mcp"
+
+    sse_app = MagicMock()
+    sse_app.router.lifespan_context = MagicMock(name="sse_lifespan")
+    http_app = MagicMock()
+    http_app.router.lifespan_context = MagicMock(name="http_lifespan")
+
+    mock_mcp.sse_app.return_value = sse_app
+    mock_mcp.streamable_http_app.return_value = http_app
+    sse_app.routes = []
+    http_app.routes = []
+    return sse_app, http_app
+
+
 class TestMainCliArgs(unittest.TestCase):
     def test_main_parses_fetch_backend_flag(self):
         with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--fetch-backend", "auto"]), \
@@ -549,6 +569,19 @@ class TestMainCliArgs(unittest.TestCase):
             mock_mcp.run.assert_called_once()
         self.assertEqual(duckduckgo_mcp_server.server.fetcher.default_backend, "httpx")
 
+    def test_main_stdio_rejects_mixed_with_http(self):
+        for bad_transports in [
+            ["stdio", "sse"],
+            ["stdio", "streamable-http"],
+            ["stdio", "sse", "streamable-http"],
+        ]:
+            with self.subTest(transports=bad_transports):
+                argv = ["duckduckgo-mcp-server", "--transport"] + bad_transports
+                with patch.object(sys, "argv", argv), \
+                     patch("duckduckgo_mcp_server.server.mcp"):
+                    with self.assertRaises(SystemExit):
+                        duckduckgo_mcp_server.server.main()
+
     def test_main_applies_host_and_port_to_settings(self):
         argv = [
             "duckduckgo-mcp-server",
@@ -557,18 +590,109 @@ class TestMainCliArgs(unittest.TestCase):
             "--port", "7070",
         ]
         with patch.object(sys, "argv", argv), \
-             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            _setup_mock_mcp_for_http(mock_mcp)
             duckduckgo_mcp_server.server.main()
             self.assertEqual(mock_mcp.settings.host, "0.0.0.0")
             self.assertEqual(mock_mcp.settings.port, 7070)
-            mock_mcp.run.assert_called_once_with(transport="streamable-http")
+            mock_uvicorn_run.assert_called_once()
+            call_kwargs = mock_uvicorn_run.call_args.kwargs
+            self.assertEqual(call_kwargs["host"], "0.0.0.0")
+            self.assertEqual(call_kwargs["port"], 7070)
 
-    def test_main_rejects_host_or_port_with_stdio(self):
-        argv = ["duckduckgo-mcp-server", "--port", "7070"]
+    def test_main_dual_transport_adds_post_sse_route(self):
+        argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]
         with patch.object(sys, "argv", argv), \
-             patch("duckduckgo_mcp_server.server.mcp"):
-            with self.assertRaises(SystemExit):
-                duckduckgo_mcp_server.server.main()
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            _setup_mock_mcp_for_http(mock_mcp)
+            async def handler(request):
+                pass
+            mcp_route = StarletteRoute("/mcp", handler, methods=["GET"])
+            mock_mcp.streamable_http_app.return_value.routes = [mcp_route]
+            duckduckgo_mcp_server.server.main()
+            app = mock_uvicorn_run.call_args[0][0]
+            post_sse_routes = [
+                r for r in app.routes
+                if isinstance(r, StarletteRoute) and r.path == "/sse" and "POST" in r.methods
+            ]
+            self.assertEqual(len(post_sse_routes), 1)
+
+    def test_main_route_dedup_prevents_duplicates(self):
+        argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]
+        async def handler(request):
+            pass
+        shared = StarletteRoute("/common", handler, methods=["GET"])
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            sse_app, http_app = _setup_mock_mcp_for_http(mock_mcp)
+            sse_app.routes = [shared]
+            http_app.routes = [shared]
+            duckduckgo_mcp_server.server.main()
+            app = mock_uvicorn_run.call_args[0][0]
+            matching = [
+                r for r in app.routes
+                if isinstance(r, StarletteRoute) and r.path == "/common" and "GET" in r.methods
+            ]
+            self.assertEqual(len(matching), 1, "Same (path, method) should be deduplicated")
+
+    def test_main_route_dedup_allows_different_methods(self):
+        argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]
+        async def handler(request):
+            pass
+        get_route = StarletteRoute("/common", handler, methods=["GET"])
+        post_route = StarletteRoute("/common", handler, methods=["POST"])
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            sse_app, http_app = _setup_mock_mcp_for_http(mock_mcp)
+            sse_app.routes = [get_route]
+            http_app.routes = [post_route]
+            duckduckgo_mcp_server.server.main()
+            app = mock_uvicorn_run.call_args[0][0]
+            matching = [
+                r for r in app.routes
+                if isinstance(r, StarletteRoute) and r.path == "/common"
+            ]
+            self.assertEqual(len(matching), 2, "Same path with different methods should both be added")
+            self.assertTrue(any("GET" in r.methods for r in matching))
+            self.assertTrue(any("POST" in r.methods for r in matching))
+
+    def test_main_lifespan_selection(self):
+        for transports, expected_lifespan_name in [
+            (["sse"], "sse_lifespan"),
+            (["streamable-http"], "http_lifespan"),
+            (["sse", "streamable-http"], "http_lifespan"),
+        ]:
+            with self.subTest(transports=transports):
+                argv = ["duckduckgo-mcp-server", "--transport"] + transports
+                with patch.object(sys, "argv", argv), \
+                     patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+                     patch("uvicorn.run") as mock_uvicorn_run:
+                    _setup_mock_mcp_for_http(mock_mcp)
+                    duckduckgo_mcp_server.server.main()
+                    app = mock_uvicorn_run.call_args[0][0]
+                    lifespan = app.router.lifespan_context
+                    self.assertEqual(
+                        lifespan._mock_name,
+                        expected_lifespan_name,
+                        f"Wrong lifespan for {transports}",
+                    )
+
+    def test_main_invalid_transport_shows_error(self):
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server"]), \
+             patch("duckduckgo_mcp_server.server.mcp"), \
+             patch("uvicorn.run"):
+            with patch.object(argparse.ArgumentParser, "parse_args") as mock_parse:
+                args = MagicMock()
+                args.transport = ["no-such-transport"]
+                args.fetch_backend = "httpx"
+                mock_parse.return_value = args
+                with self.assertRaises(SystemExit) as cm:
+                    duckduckgo_mcp_server.server.main()
+                self.assertEqual(cm.exception.code, 1)
 
 
 class TestConfiguration(unittest.TestCase):
