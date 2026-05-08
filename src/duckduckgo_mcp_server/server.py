@@ -456,13 +456,13 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
+        default=None,
         help="Bind address for sse / streamable-http transports (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
+        default=None,
         help="Bind port for sse / streamable-http transports (default: 8000).",
     )
     args = parser.parse_args()
@@ -472,6 +472,9 @@ def main():
     if "stdio" in transports and len(transports) > 1:
         parser.error("Cannot mix stdio with HTTP transports")
 
+    if transports == {"stdio"} and (args.host is not None or args.port is not None):
+        parser.error("--host / --port are only valid with --transport sse or streamable-http")
+
     # Reconfigure the module-level fetcher with the chosen backend.
     fetcher = WebContentFetcher(backend=args.fetch_backend)
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
@@ -479,25 +482,16 @@ def main():
     if transports == {"stdio"}:
         mcp.run(transport="stdio")
     elif transports.issubset({"sse", "streamable-http"}):
-        mcp.settings.json_response = True
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
+        host = args.host or "127.0.0.1"
+        port = args.port or 8000
+        mcp.settings.host = host
+        mcp.settings.port = port
 
         # SSE and Streamable HTTP app setup
         sse_app = mcp.sse_app()
         http_app = mcp.streamable_http_app()
 
-        # Find the streamable_http_app handler (needed for POST /sse compatibility)
-        http_handler = None
-        for route in http_app.routes:
-            if (
-                isinstance(route, Route)
-                and route.path == mcp.settings.streamable_http_path
-            ):
-                http_handler = route.endpoint
-                break
-
-        # Create a combined routes list with proper deduplication
+        # Create combined routes with proper deduplication
         combined_routes: list[BaseRoute] = []
         added_routes: set[tuple[str, tuple[str, ...]]] = set()
 
@@ -505,19 +499,6 @@ def main():
             methods = tuple(sorted(route.methods or ["GET"]))
             return (route.path, methods)
 
-        # 1. Compatibility route: POST /sse -> StreamableHTTP (for llama.cpp etc.)
-        if http_handler:
-            compat_route = Route(
-                mcp.settings.sse_path, http_handler, methods=["POST"]
-            )
-            key = _route_key(compat_route)
-            combined_routes.append(compat_route)
-            added_routes.add(key)
-            print(
-                f"Added POST support to {mcp.settings.sse_path} for Streamable HTTP compatibility"
-            )
-
-        # 2. Regular routes (dedupe by (path, methods))
         for app_routes in [
             sse_app.routes if "sse" in transports else [],
             http_app.routes if "streamable-http" in transports else [],
@@ -531,20 +512,31 @@ def main():
                 else:
                     combined_routes.append(route)
 
-        # Create the Starlette app with combined routes
-        # Prefer http_app lifespan if available (it has more complete lifecycle)
-        lifespan = (
-            http_app.router.lifespan_context
-            if "streamable-http" in transports
-            else sse_app.router.lifespan_context
-        )
+        # Combine lifespan contexts when both transports are active
+        sse_lifespan = sse_app.router.lifespan_context
+        http_lifespan = http_app.router.lifespan_context
+
+        if "streamable-http" in transports and "sse" in transports:
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def _combined_lifespan(app):
+                async with sse_lifespan(app):
+                    async with http_lifespan(app):
+                        yield
+
+            lifespan = _combined_lifespan
+        elif "streamable-http" in transports:
+            lifespan = http_lifespan
+        else:
+            lifespan = sse_lifespan
+
         app = Starlette(routes=combined_routes, lifespan=lifespan)
 
-        # Add CORS middleware
+        # Add CORS middleware for browser-based MCP clients
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
             expose_headers=["Mcp-Session-Id"],
@@ -555,21 +547,14 @@ def main():
         )
         if "sse" in transports:
             print(
-                f"SSE endpoint: http://{args.host}:{args.port}{mcp.settings.sse_path}"
+                f"SSE endpoint: http://{host}:{port}{mcp.settings.sse_path}"
             )
         if "streamable-http" in transports:
             print(
-                f"Streamable HTTP endpoint: http://{args.host}:{args.port}{mcp.settings.streamable_http_path}"
+                f"Streamable HTTP endpoint: http://{host}:{port}{mcp.settings.streamable_http_path}"
             )
 
-        uvicorn.run(app, host=args.host, port=args.port)
-    else:
-        print(
-            f"Error: Invalid transport combination: {transports}. "
-            "Valid options: stdio | sse | streamable-http | sse streamable-http",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

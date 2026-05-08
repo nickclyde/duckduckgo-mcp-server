@@ -601,24 +601,6 @@ class TestMainCliArgs(unittest.TestCase):
             self.assertEqual(call_kwargs["host"], "0.0.0.0")
             self.assertEqual(call_kwargs["port"], 7070)
 
-    def test_main_dual_transport_adds_post_sse_route(self):
-        argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]
-        with patch.object(sys, "argv", argv), \
-             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
-             patch("uvicorn.run") as mock_uvicorn_run:
-            _setup_mock_mcp_for_http(mock_mcp)
-            async def handler(request):
-                pass
-            mcp_route = StarletteRoute("/mcp", handler, methods=["GET"])
-            mock_mcp.streamable_http_app.return_value.routes = [mcp_route]
-            duckduckgo_mcp_server.server.main()
-            app = mock_uvicorn_run.call_args[0][0]
-            post_sse_routes = [
-                r for r in app.routes
-                if isinstance(r, StarletteRoute) and r.path == "/sse" and "POST" in r.methods
-            ]
-            self.assertEqual(len(post_sse_routes), 1)
-
     def test_main_route_dedup_prevents_duplicates(self):
         argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]
         async def handler(request):
@@ -664,35 +646,52 @@ class TestMainCliArgs(unittest.TestCase):
         for transports, expected_lifespan_name in [
             (["sse"], "sse_lifespan"),
             (["streamable-http"], "http_lifespan"),
-            (["sse", "streamable-http"], "http_lifespan"),
+            (["sse", "streamable-http"], "combined"),
         ]:
             with self.subTest(transports=transports):
                 argv = ["duckduckgo-mcp-server", "--transport"] + transports
                 with patch.object(sys, "argv", argv), \
                      patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
                      patch("uvicorn.run") as mock_uvicorn_run:
-                    _setup_mock_mcp_for_http(mock_mcp)
+                    sse_app, http_app = _setup_mock_mcp_for_http(mock_mcp)
                     duckduckgo_mcp_server.server.main()
                     app = mock_uvicorn_run.call_args[0][0]
                     lifespan = app.router.lifespan_context
-                    self.assertEqual(
-                        lifespan._mock_name,
-                        expected_lifespan_name,
-                        f"Wrong lifespan for {transports}",
-                    )
+                    if expected_lifespan_name == "combined":
+                        self.assertIsNot(lifespan, sse_app.router.lifespan_context)
+                        self.assertIsNot(lifespan, http_app.router.lifespan_context)
+                    else:
+                        self.assertEqual(
+                            lifespan._mock_name,
+                            expected_lifespan_name,
+                            f"Wrong lifespan for {transports}",
+                        )
 
-    def test_main_invalid_transport_shows_error(self):
-        with patch.object(sys, "argv", ["duckduckgo-mcp-server"]), \
-             patch("duckduckgo_mcp_server.server.mcp"), \
-             patch("uvicorn.run"):
-            with patch.object(argparse.ArgumentParser, "parse_args") as mock_parse:
-                args = MagicMock()
-                args.transport = ["no-such-transport"]
-                args.fetch_backend = "httpx"
-                mock_parse.return_value = args
-                with self.assertRaises(SystemExit) as cm:
-                    duckduckgo_mcp_server.server.main()
-                self.assertEqual(cm.exception.code, 1)
+    def test_main_stdio_rejects_host_port(self):
+        for bad_arg in (
+            ["--host", "0.0.0.0"],
+            ["--port", "7070"],
+            ["--host", "0.0.0.0", "--port", "7070"],
+        ):
+            with self.subTest(bad_arg=bad_arg):
+                argv = ["duckduckgo-mcp-server"] + bad_arg
+                with patch.object(sys, "argv", argv), \
+                     patch("duckduckgo_mcp_server.server.mcp"):
+                    with self.assertRaises(SystemExit):
+                        duckduckgo_mcp_server.server.main()
+
+    def test_main_http_uses_default_host_port(self):
+        argv = ["duckduckgo-mcp-server", "--transport", "streamable-http"]
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            _setup_mock_mcp_for_http(mock_mcp)
+            duckduckgo_mcp_server.server.main()
+            self.assertEqual(mock_mcp.settings.host, "127.0.0.1")
+            self.assertEqual(mock_mcp.settings.port, 8000)
+            call_kwargs = mock_uvicorn_run.call_args.kwargs
+            self.assertEqual(call_kwargs["host"], "127.0.0.1")
+            self.assertEqual(call_kwargs["port"], 8000)
 
 
 class TestConfiguration(unittest.TestCase):
