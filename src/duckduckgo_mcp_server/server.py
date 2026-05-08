@@ -428,11 +428,17 @@ async def fetch_content(
 
 def main():
     global fetcher
+    from starlette.applications import Starlette
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.routing import BaseRoute, Route
+    import uvicorn
+
     parser = argparse.ArgumentParser(description="DuckDuckGo MCP Server")
     parser.add_argument(
         "--transport",
+        nargs="+",
         choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
+        default=["stdio"],
         help="Transport protocol to use (default: stdio)",
     )
     parser.add_argument(
@@ -450,30 +456,105 @@ def main():
     )
     parser.add_argument(
         "--host",
+        default=None,
         help="Bind address for sse / streamable-http transports (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--port",
         type=int,
+        default=None,
         help="Bind port for sse / streamable-http transports (default: 8000).",
     )
     args = parser.parse_args()
 
-    if args.transport == "stdio" and (args.host is not None or args.port is not None):
+    transports = set(args.transport)
+
+    if "stdio" in transports and len(transports) > 1:
+        parser.error("Cannot mix stdio with HTTP transports")
+
+    if transports == {"stdio"} and (args.host is not None or args.port is not None):
         parser.error("--host / --port are only valid with --transport sse or streamable-http")
 
-    if args.host is not None:
-        mcp.settings.host = args.host
-    if args.port is not None:
-        mcp.settings.port = args.port
-
     # Reconfigure the module-level fetcher with the chosen backend.
-    # Safe because tool invocations look up `fetcher` at call time (late binding).
     fetcher = WebContentFetcher(backend=args.fetch_backend)
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
-    if args.transport in ("sse", "streamable-http"):
-        print(f"  Bind address: {mcp.settings.host}:{mcp.settings.port}", file=sys.stderr)
-    mcp.run(transport=args.transport)
+
+    if transports == {"stdio"}:
+        mcp.run(transport="stdio")
+    elif transports.issubset({"sse", "streamable-http"}):
+        host = args.host or "127.0.0.1"
+        port = args.port or 8000
+        mcp.settings.host = host
+        mcp.settings.port = port
+
+        # SSE and Streamable HTTP app setup
+        sse_app = mcp.sse_app()
+        http_app = mcp.streamable_http_app()
+
+        # Create combined routes with proper deduplication
+        combined_routes: list[BaseRoute] = []
+        added_routes: set[tuple[str, tuple[str, ...]]] = set()
+
+        def _route_key(route: Route) -> tuple[str, tuple[str, ...]]:
+            methods = tuple(sorted(route.methods or ["GET"]))
+            return (route.path, methods)
+
+        for app_routes in [
+            sse_app.routes if "sse" in transports else [],
+            http_app.routes if "streamable-http" in transports else [],
+        ]:
+            for route in app_routes:
+                if isinstance(route, Route):
+                    key = _route_key(route)
+                    if key not in added_routes:
+                        combined_routes.append(route)
+                        added_routes.add(key)
+                else:
+                    combined_routes.append(route)
+
+        # Combine lifespan contexts when both transports are active
+        sse_lifespan = sse_app.router.lifespan_context
+        http_lifespan = http_app.router.lifespan_context
+
+        if "streamable-http" in transports and "sse" in transports:
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def _combined_lifespan(app):
+                async with sse_lifespan(app):
+                    async with http_lifespan(app):
+                        yield
+
+            lifespan = _combined_lifespan
+        elif "streamable-http" in transports:
+            lifespan = http_lifespan
+        else:
+            lifespan = sse_lifespan
+
+        app = Starlette(routes=combined_routes, lifespan=lifespan)
+
+        # Add CORS middleware for browser-based MCP clients
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["Mcp-Session-Id"],
+        )
+
+        print(
+            f"Starting DuckDuckGo MCP Server with {' and '.join(transports)} transport"
+        )
+        if "sse" in transports:
+            print(
+                f"SSE endpoint: http://{host}:{port}{mcp.settings.sse_path}"
+            )
+        if "streamable-http" in transports:
+            print(
+                f"Streamable HTTP endpoint: http://{host}:{port}{mcp.settings.streamable_http_path}"
+            )
+
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
