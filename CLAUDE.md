@@ -32,6 +32,12 @@ uv run python -m pytest src/duckduckgo_mcp_server/test_server.py::TestRateLimite
 
 # Build package
 uv build
+
+# Lint (ruff) — matches the CI `quality` job
+uv run ruff check .
+
+# Audit dependencies for known vulnerabilities (informational)
+uv run --with pip-audit pip-audit --desc
 ```
 
 ## Architecture
@@ -56,7 +62,7 @@ Environment variables read at startup (not per-request):
 
 - **Unit tests** (`test_server.py`): 21 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
 - **E2E tests** (`test_e2e.py`): 4 tests using `pytest-asyncio` with MCP SDK's `create_connected_server_and_client_session` from `mcp.shared.memory` for in-memory MCP client/server testing.
-- **CI**: GitHub Actions (`.github/workflows/test.yml`) runs tests on Python 3.10–3.14 using `astral-sh/setup-uv`.
+- **CI**: GitHub Actions (`.github/workflows/test.yml`) runs a `test` job (pytest on Python 3.10–3.14) and a `quality` job (`ruff check` — blocking — plus a non-blocking `pip-audit` dependency scan), all using `astral-sh/setup-uv`.
 
 ## Key Dependencies
 

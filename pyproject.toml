@@ -41,4 +41,14 @@ dev = [
     "anyio>=4.0",
     "pytest>=9.0.2",
     "pytest-asyncio>=0.25.0",
+    "ruff>=0.6.0",
 ]
+
+[tool.ruff]
+# Long, descriptive User-Agent strings and tool docstrings intentionally exceed
+# typical line lengths, so line-length (E501) is not enforced.
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

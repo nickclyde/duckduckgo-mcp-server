@@ -1,7 +1,7 @@
 from mcp.server.fastmcp import FastMCP, Context
 import httpx
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Any
+from typing import List, Optional
 from dataclasses import dataclass
 import urllib.parse
 import sys
@@ -9,7 +9,6 @@ import traceback
 import asyncio
 import argparse
 from datetime import datetime, timedelta
-import time
 import re
 import os
 import socket
@@ -651,7 +650,7 @@ if SEARCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
 searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE, backend=SEARCH_BACKEND)
 fetcher = WebContentFetcher(allow_private_urls=ALLOW_PRIVATE_URLS)
 
-print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
+print("DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
 print(f"  Search backend: {searcher.backend}", file=sys.stderr)

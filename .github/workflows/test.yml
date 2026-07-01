@@ -17,3 +17,19 @@ jobs:
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync
       - run: uv run python -m pytest src/duckduckgo_mcp_server/ -v
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync
+      - name: Lint (ruff)
+        run: uv run ruff check .
+      # Reports known vulnerabilities in dependencies. Non-blocking: most findings
+      # are in transitive deps we can't directly pin, so this surfaces them without
+      # gating every PR on upstream advisories.
+      - name: Dependency vulnerability audit (pip-audit)
+        continue-on-error: true
+        run: uv run --with pip-audit pip-audit --desc
