@@ -239,7 +239,12 @@ async def _validate_public_url(url: str) -> None:
     if lowered == "localhost" or lowered.endswith(".localhost"):
         raise BlockedURLError(f"refusing to fetch loopback host '{host}'")
 
-    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as e:
+        # urllib raises ValueError for an out-of-range port; treat as blocked
+        # rather than letting it surface as a generic unexpected error.
+        raise BlockedURLError(f"invalid port in URL '{url}': {e}") from e
     try:
         infos = await asyncio.to_thread(
             socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM
@@ -252,8 +257,14 @@ async def _validate_public_url(url: str) -> None:
         # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) before classifying.
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
+        # `not is_global` is the primary catch-all (it also covers ranges the
+        # explicit flags miss, e.g. RFC 6598 CGNAT 100.64.0.0/10 used by Tailscale
+        # and some k8s/cloud fabrics). The explicit flags stay because a few ranges
+        # report is_global=True yet are non-routable (e.g. NAT64 64:ff9b::/96,
+        # caught by is_reserved).
         if (
-            ip.is_private
+            not ip.is_global
+            or ip.is_private
             or ip.is_loopback
             or ip.is_link_local
             or ip.is_reserved

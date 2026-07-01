@@ -571,6 +571,17 @@ class TestSSRFGuard(unittest.TestCase):
         # Either resolves to an IPv4 loopback or fails to resolve — both are blocked.
         self._assert_blocked("http://[::ffff:127.0.0.1]/")
 
+    def test_rejects_cgnat_shared_address_space(self):
+        # RFC 6598 100.64.0.0/10 is not is_private/is_reserved but is non-global;
+        # it's used by CGNAT and overlay networks like Tailscale.
+        self._assert_blocked("http://100.64.0.1/")
+        self._assert_blocked("http://100.127.255.254/")
+
+    def test_rejects_invalid_port(self):
+        # An out-of-range port makes urllib's .port raise ValueError; the guard
+        # should surface a clean BlockedURLError, not a generic failure.
+        self._assert_blocked("http://example.com:99999/")
+
     def test_rejects_non_http_scheme(self):
         self._assert_blocked("file:///etc/passwd")
         self._assert_blocked("ftp://example.com/x")
