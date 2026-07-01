@@ -73,6 +73,15 @@ def _is_search_block(status: int, html: str) -> bool:
     return False
 
 
+def _curl_cffi_available() -> bool:
+    """Return True if the optional curl_cffi (Chrome TLS impersonation) is installed."""
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 class DuckDuckGoSearcher:
     BASE_URL = "https://html.duckduckgo.com/html"
     HEADERS = {
@@ -121,14 +130,22 @@ class DuckDuckGoSearcher:
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
         """Format results in a natural language style that's easier for LLMs to process"""
         if not results:
-            return (
+            message = (
                 "No results were found for your search query. This could be due to "
                 "DuckDuckGo's bot detection or the query returned no matches. Please try "
-                "rephrasing your search or try again in a few minutes. If this persists, "
-                "DuckDuckGo may be blocking this server's TLS fingerprint; installing the "
-                "optional browser backend (pip install 'duckduckgo-mcp-server[browser]') "
-                "enables Chrome TLS impersonation, which typically resolves it."
+                "rephrasing your search or try again in a few minutes."
             )
+            # Only suggest the browser backend when it isn't already installed —
+            # if curl_cffi is present the impersonation fallback already ran, so
+            # pointing the user at an install they've done would just mislead.
+            if not _curl_cffi_available():
+                message += (
+                    " If this persists, DuckDuckGo may be blocking this server's TLS "
+                    "fingerprint; installing the optional browser backend "
+                    "(pip install 'duckduckgo-mcp-server[browser]') enables Chrome TLS "
+                    "impersonation, which typically resolves it."
+                )
+            return message
 
         output = []
         output.append(f"Found {len(results)} search results:\n")
@@ -256,6 +273,15 @@ class DuckDuckGoSearcher:
                 await ctx.info("DuckDuckGo returned HTTP 403 to httpx; retrying with curl backend")
                 return await self._request_curl(data)
             raise
+        except httpx.ConnectError as e:
+            # A rejected/reset TLS handshake surfaces as a ConnectError (not an
+            # HTTPStatusError), so give curl's impersonated handshake a shot before
+            # giving up. curl uses a separate network stack, so on a genuine outage
+            # it fails fast rather than masking the real error.
+            await ctx.info(
+                f"httpx connection error ({type(e).__name__}); retrying with curl backend"
+            )
+            return await self._request_curl(data)
 
         if _is_search_block(status, html):
             await ctx.info(

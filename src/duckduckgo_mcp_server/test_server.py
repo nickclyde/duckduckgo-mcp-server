@@ -323,6 +323,42 @@ class TestDuckDuckGoSearcherBackend(unittest.TestCase):
         self.assertEqual(called["curl"], 0)
         self.assertEqual(len(results), 1)
 
+    def test_auto_falls_back_to_curl_on_connect_error(self):
+        """A rejected TLS handshake (httpx.ConnectError) should retry with curl."""
+        searcher = DuckDuckGoSearcher(backend="auto")
+        html = _make_ddg_html([
+            {"title": "Rescued", "href": "https://rescued.com", "snippet": "via curl"},
+        ])
+        called = {"curl": 0}
+
+        async def fake_httpx(data):
+            raise httpx.ConnectError("TLS handshake rejected")
+
+        async def fake_curl(data):
+            called["curl"] += 1
+            return html
+
+        with patch.object(searcher, "_request_httpx", side_effect=fake_httpx), \
+             patch.object(searcher, "_request_curl", side_effect=fake_curl):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
+
+        self.assertEqual(called["curl"], 1)
+        self.assertEqual(len(results), 1)
+
+    def test_empty_results_message_omits_hint_when_curl_installed(self):
+        """When curl_cffi is available the 'install [browser]' hint is dropped."""
+        searcher = DuckDuckGoSearcher()
+        with patch("duckduckgo_mcp_server.server._curl_cffi_available", return_value=True):
+            message = searcher.format_results_for_llm([])
+        self.assertIn("No results were found", message)
+        self.assertNotIn("pip install", message)
+
+    def test_empty_results_message_includes_hint_when_curl_missing(self):
+        searcher = DuckDuckGoSearcher()
+        with patch("duckduckgo_mcp_server.server._curl_cffi_available", return_value=False):
+            message = searcher.format_results_for_llm([])
+        self.assertIn("pip install 'duckduckgo-mcp-server[browser]'", message)
+
     def test_httpx_backend_does_not_fall_back_on_202(self):
         """Explicit httpx backend keeps legacy behavior: 202 → 0 results, no curl."""
         searcher = DuckDuckGoSearcher(backend="httpx")
