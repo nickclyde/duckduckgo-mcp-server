@@ -19,6 +19,7 @@ from duckduckgo_mcp_server.server import (
     SearchResult,
     SUPPORTED_FETCH_BACKENDS,
     WebContentFetcher,
+    _is_search_block,
 )
 
 try:
@@ -233,6 +234,119 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
     def test_search_returns_empty_on_no_results(self):
         html = "<html><body><p>No results</p></body></html>"
         results = self._run_search(html)
+        self.assertEqual(results, [])
+
+
+class TestDuckDuckGoSearcherBackend(unittest.TestCase):
+    def test_is_search_block_truth_table(self):
+        # 202 (fingerprint block) and 403 are block signals regardless of body.
+        self.assertTrue(_is_search_block(202, "<html>14kb block page</html>"))
+        self.assertTrue(_is_search_block(403, "forbidden"))
+        # A truly empty 200 body is a block; a 200 with any content is not.
+        self.assertTrue(_is_search_block(200, "   "))
+        self.assertFalse(_is_search_block(200, "<html>real results</html>"))
+        # Non-2xx errors are handled via raise_for_status, not this helper.
+        self.assertFalse(_is_search_block(500, ""))
+
+    def test_default_backend_is_auto(self):
+        self.assertEqual(DuckDuckGoSearcher().backend, "auto")
+
+    def test_init_rejects_unknown_backend(self):
+        with self.assertRaises(ValueError):
+            DuckDuckGoSearcher(backend="bogus")
+
+    def test_auto_falls_back_to_curl_on_202(self):
+        """A 202 fingerprint-block on httpx must transparently retry with curl."""
+        searcher = DuckDuckGoSearcher(backend="auto")
+        html = _make_ddg_html([
+            {"title": "Rescued", "href": "https://rescued.com", "snippet": "via curl"},
+        ])
+        called = {"curl": 0}
+
+        async def fake_httpx(data):
+            return 202, "<html><body>empty block page</body></html>"
+
+        async def fake_curl(data):
+            called["curl"] += 1
+            return html
+
+        with patch.object(searcher, "_request_httpx", side_effect=fake_httpx), \
+             patch.object(searcher, "_request_curl", side_effect=fake_curl):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
+
+        self.assertEqual(called["curl"], 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title, "Rescued")
+
+    def test_auto_falls_back_to_curl_on_403(self):
+        searcher = DuckDuckGoSearcher(backend="auto")
+        html = _make_ddg_html([
+            {"title": "Rescued", "href": "https://rescued.com", "snippet": "via curl"},
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        err = httpx.HTTPStatusError("forbidden", request=MagicMock(), response=mock_resp)
+        called = {"curl": 0}
+
+        async def fake_httpx(data):
+            raise err
+
+        async def fake_curl(data):
+            called["curl"] += 1
+            return html
+
+        with patch.object(searcher, "_request_httpx", side_effect=fake_httpx), \
+             patch.object(searcher, "_request_curl", side_effect=fake_curl):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
+
+        self.assertEqual(called["curl"], 1)
+        self.assertEqual(len(results), 1)
+
+    def test_auto_does_not_fall_back_on_normal_results(self):
+        searcher = DuckDuckGoSearcher(backend="auto")
+        html = _make_ddg_html([
+            {"title": "Normal", "href": "https://normal.com", "snippet": "ok"},
+        ])
+        called = {"curl": 0}
+
+        async def fake_httpx(data):
+            return 200, html
+
+        async def fake_curl(data):
+            called["curl"] += 1
+            return "<html></html>"
+
+        with patch.object(searcher, "_request_httpx", side_effect=fake_httpx), \
+             patch.object(searcher, "_request_curl", side_effect=fake_curl):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
+
+        self.assertEqual(called["curl"], 0)
+        self.assertEqual(len(results), 1)
+
+    def test_httpx_backend_does_not_fall_back_on_202(self):
+        """Explicit httpx backend keeps legacy behavior: 202 → 0 results, no curl."""
+        searcher = DuckDuckGoSearcher(backend="httpx")
+        called = {"curl": 0}
+
+        async def fake_httpx(data):
+            return 202, "<html><body>empty block page</body></html>"
+
+        async def fake_curl(data):
+            called["curl"] += 1
+            return "should not be called"
+
+        with patch.object(searcher, "_request_httpx", side_effect=fake_httpx), \
+             patch.object(searcher, "_request_curl", side_effect=fake_curl):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
+
+        self.assertEqual(called["curl"], 0)
+        self.assertEqual(results, [])
+
+    def test_curl_backend_missing_dependency_returns_empty(self):
+        """curl backend with curl_cffi absent → empty results (hint logged), no crash."""
+        searcher = DuckDuckGoSearcher(backend="curl")
+        with patch.dict(sys.modules, {"curl_cffi": None, "curl_cffi.requests": None}):
+            results = asyncio.run(searcher.search("q", DummyCtx()))
         self.assertEqual(results, [])
 
 
@@ -568,6 +682,13 @@ class TestMainCliArgs(unittest.TestCase):
             duckduckgo_mcp_server.server.main()
             mock_mcp.run.assert_called_once()
         self.assertEqual(duckduckgo_mcp_server.server.fetcher.default_backend, "httpx")
+
+    def test_main_parses_search_backend_flag(self):
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--search-backend", "curl"]), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+            duckduckgo_mcp_server.server.main()
+            mock_mcp.run.assert_called_once()
+        self.assertEqual(duckduckgo_mcp_server.server.searcher.backend, "curl")
 
     def test_main_stdio_rejects_mixed_with_http(self):
         for bad_transports in [

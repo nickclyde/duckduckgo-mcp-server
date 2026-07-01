@@ -107,9 +107,11 @@ When running with `sse` or `streamable-http`, override the default bind address 
 uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 ```
 
-### Fetch Backend (bypassing bot detection)
+### Backends (bypassing bot detection)
 
-Some sites block the default `httpx` client because of its distinctive TLS fingerprint, regardless of User-Agent — Cloudflare Bot Management and similar filters key on the JA3/TLS handshake, not on headers. An opt-in backend, `curl` (implemented via `curl_cffi`), impersonates a real Chrome browser's TLS handshake and passes through those checks.
+Some sites — and, as of recently, DuckDuckGo's own search endpoint (`html.duckduckgo.com`) — block the default `httpx` client because of its distinctive TLS fingerprint, regardless of User-Agent. Cloudflare Bot Management and similar filters key on the JA3/TLS handshake, not on headers, so `html.duckduckgo.com` may answer `httpx` with an empty **HTTP 202** page (silently yielding "no results"). An opt-in backend, `curl` (implemented via `curl_cffi`), impersonates a real Chrome browser's TLS handshake and passes through those checks.
+
+Both the `search` tool and the `fetch_content` tool support these backends.
 
 **Installation:**
 
@@ -146,9 +148,24 @@ uv pip install "duckduckgo-mcp-server[browser]"
 
 2. **Per-call override** via the `backend` argument on the `fetch_content` tool (overrides the CLI default for that single call). The tool exposes `backend` in its input schema, so an MCP client can choose `"httpx"`, `"curl"`, or `"auto"` on a fetch-by-fetch basis.
 
-The `search` tool always uses `httpx` — DuckDuckGo's search endpoint doesn't require impersonation.
+For `fetch_content`, the default stays `httpx` so users who don't need the impersonation don't pay for the extra dependency.
 
-The default stays `httpx` so users who don't need the impersonation don't pay for the extra dependency.
+#### Search backend
+
+Because DuckDuckGo's search endpoint now fingerprint-blocks plain `httpx`, the `search` tool defaults to **`auto`**: it tries `httpx` first and falls back to `curl` when it detects a block (HTTP 202/403). The fallback only works if the `[browser]` extra is installed; otherwise search returns a message telling you to install it.
+
+Configure the search backend with the `--search-backend` CLI flag or the `DDG_SEARCH_BACKEND` environment variable (`auto` (default) / `httpx` / `curl`):
+
+```bash
+# Recommended: install the browser extra so the auto fallback can impersonate Chrome
+uvx --with "duckduckgo-mcp-server[browser]" duckduckgo-mcp-server
+
+# Force curl for every search
+uvx --with "duckduckgo-mcp-server[browser]" duckduckgo-mcp-server --search-backend curl
+
+# Opt out of the fallback (legacy behavior — may return no results while blocked)
+uvx duckduckgo-mcp-server --search-backend httpx
+```
 
 ### Development
 

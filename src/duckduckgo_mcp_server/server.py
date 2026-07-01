@@ -51,28 +51,84 @@ class RateLimiter:
         self.requests.append(now)
 
 
+# Backends shared by both search and fetch_content. "auto" tries httpx first and
+# falls back to curl (curl_cffi Chrome TLS impersonation) when the response looks
+# like a fingerprint-based block.
+SUPPORTED_FETCH_BACKENDS = ("httpx", "curl", "auto")
+
+
+def _is_search_block(status: int, html: str) -> bool:
+    """Detect a fingerprint-based block on the DuckDuckGo HTML search endpoint.
+
+    html.duckduckgo.com now serves an HTTP 202 with an empty results page to
+    clients whose TLS fingerprint it doesn't like (see issue #46). Because 202 is
+    a 2xx status, ``raise_for_status()`` never fires and the empty page silently
+    parses to zero results. A 403 is the other classic block signal, and a truly
+    empty 200 body is treated the same way.
+    """
+    if status in (202, 403):
+        return True
+    if status == 200 and not (html or "").strip():
+        return True
+    return False
+
+
 class DuckDuckGoSearcher:
     BASE_URL = "https://html.duckduckgo.com/html"
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
     }
 
-    def __init__(self, safe_search: SafeSearchMode = SafeSearchMode.MODERATE, default_region: str = ""):
+    def __init__(
+        self,
+        safe_search: SafeSearchMode = SafeSearchMode.MODERATE,
+        default_region: str = "",
+        backend: str = "auto",
+    ):
         """
         Initialize DuckDuckGo searcher
 
         Args:
             safe_search: SafeSearch filtering mode (STRICT/MODERATE/OFF) - fixed at startup
             default_region: Default region code (e.g., 'us-en', 'cn-zh', 'wt-wt' for no region)
+            backend: HTTP client backend for the search request. One of "httpx",
+                "curl", or "auto" (default). "auto" tries httpx first and falls back
+                to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a
+                fingerprint-based block (HTTP 202/403). "curl" and the auto fallback
+                require the optional [browser] extra.
         """
+        if backend not in SUPPORTED_FETCH_BACKENDS:
+            raise ValueError(
+                f"Unknown search backend '{backend}'. Supported: {SUPPORTED_FETCH_BACKENDS}"
+            )
         self.rate_limiter = RateLimiter()
         self.safe_search = safe_search
         self.default_region = default_region
+        self.backend = backend
 
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
         """Format results in a natural language style that's easier for LLMs to process"""
         if not results:
-            return "No results were found for your search query. This could be due to DuckDuckGo's bot detection or the query returned no matches. Please try rephrasing your search or try again in a few minutes."
+            return (
+                "No results were found for your search query. This could be due to "
+                "DuckDuckGo's bot detection or the query returned no matches. Please try "
+                "rephrasing your search or try again in a few minutes. If this persists, "
+                "DuckDuckGo may be blocking this server's TLS fingerprint; installing the "
+                "optional browser backend (pip install 'duckduckgo-mcp-server[browser]') "
+                "enables Chrome TLS impersonation, which typically resolves it."
+            )
 
         output = []
         output.append(f"Found {len(results)} search results:\n")
@@ -112,16 +168,17 @@ class DuckDuckGoSearcher:
                 "kp": self.safe_search.value,  # SafeSearch mode (fixed)
             }
 
-            await ctx.info(f"Searching DuckDuckGo for: {query} (SafeSearch: {self.safe_search.name}, Region: {effective_region or 'default'})")
+            await ctx.info(f"Searching DuckDuckGo for: {query} (SafeSearch: {self.safe_search.name}, Region: {effective_region or 'default'}, backend={self.backend})")
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
-                )
-                response.raise_for_status()
+            try:
+                html = await self._request(data, ctx)
+            except RuntimeError as e:
+                # curl backend requested/needed but curl_cffi isn't installed.
+                await ctx.error(str(e))
+                return []
 
             # Parse HTML response
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
             if not soup:
                 await ctx.error("Failed to parse HTML response")
                 return []
@@ -176,8 +233,67 @@ class DuckDuckGoSearcher:
             traceback.print_exc(file=sys.stderr)
             return []
 
+    async def _request(self, data: dict, ctx: Context) -> str:
+        """Perform the search POST using the configured backend, returning raw HTML.
 
-SUPPORTED_FETCH_BACKENDS = ("httpx", "curl", "auto")
+        Under "auto", tries httpx first and transparently retries with curl when
+        DuckDuckGo returns a fingerprint-based block (HTTP 202/403), which httpx's
+        TLS handshake now trips (issue #46).
+        """
+        if self.backend == "curl":
+            return await self._request_curl(data)
+
+        if self.backend == "httpx":
+            _status, html = await self._request_httpx(data)
+            return html
+
+        # auto: httpx first, fall back to curl on a block signal.
+        try:
+            status, html = await self._request_httpx(data)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 403:
+                await ctx.info("DuckDuckGo returned HTTP 403 to httpx; retrying with curl backend")
+                return await self._request_curl(data)
+            raise
+
+        if _is_search_block(status, html):
+            await ctx.info(
+                f"DuckDuckGo returned a block signal (HTTP {status}) to httpx; retrying with curl backend"
+            )
+            return await self._request_curl(data)
+
+        return html
+
+    async def _request_httpx(self, data: dict) -> tuple[int, str]:
+        """POST the search form via httpx. Returns (status_code, body).
+
+        Note: a fingerprint-blocked response is HTTP 202 (a 2xx), so
+        ``raise_for_status()`` does not fire — the caller inspects the status.
+        """
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
+            )
+            response.raise_for_status()
+            return response.status_code, response.text
+
+    async def _request_curl(self, data: dict) -> str:
+        """POST the search form via curl_cffi with Chrome 131 TLS impersonation."""
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError as e:
+            raise RuntimeError(
+                "The 'curl' search backend requires curl_cffi, which is not installed. "
+                "Install the optional extra: pip install 'duckduckgo-mcp-server[browser]'"
+            ) from e
+        # Let curl_cffi supply the impersonated browser headers for a consistent
+        # Chrome fingerprint; we only send the search form fields.
+        async with AsyncSession(impersonate="chrome131") as client:
+            response = await client.post(self.BASE_URL, data=data, timeout=30.0)
+            response.raise_for_status()
+            return response.text
+
 
 # Cloudflare / bot-filter challenge signals that appear in response bodies even
 # when the HTTP status is 200. If we see these on an httpx fetch under `auto`,
@@ -368,6 +484,7 @@ mcp = FastMCP("ddg-search")
 # Read configuration from environment variables
 SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
+SEARCH_BACKEND = os.getenv("DDG_SEARCH_BACKEND", "auto").lower()
 
 # Validate and set SafeSearch mode
 try:
@@ -376,12 +493,18 @@ except KeyError:
     print(f"Warning: Invalid DDG_SAFE_SEARCH value '{SAFE_SEARCH_MODE}', using MODERATE", file=sys.stderr)
     safe_search = SafeSearchMode.MODERATE
 
-searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
+# Validate search backend
+if SEARCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
+    print(f"Warning: Invalid DDG_SEARCH_BACKEND value '{SEARCH_BACKEND}', using auto", file=sys.stderr)
+    SEARCH_BACKEND = "auto"
+
+searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE, backend=SEARCH_BACKEND)
 fetcher = WebContentFetcher()
 
 print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
+print(f"  Search backend: {searcher.backend}", file=sys.stderr)
 
 
 @mcp.tool()
@@ -427,7 +550,7 @@ async def fetch_content(
 
 
 def main():
-    global fetcher
+    global fetcher, searcher
     from starlette.applications import Starlette
     from starlette.middleware.cors import CORSMiddleware
     from starlette.routing import BaseRoute, Route
@@ -455,6 +578,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--search-backend",
+        choices=list(SUPPORTED_FETCH_BACKENDS),
+        default=None,
+        help=(
+            "HTTP backend for the search tool. Defaults to 'auto' (or the "
+            "DDG_SEARCH_BACKEND env var). 'auto' tries httpx first and falls back to "
+            "curl (curl_cffi Chrome TLS impersonation) when DuckDuckGo returns a "
+            "fingerprint-based block (HTTP 202/403). 'curl' and the auto fallback "
+            "require the [browser] extra."
+        ),
+    )
+    parser.add_argument(
         "--host",
         default=None,
         help="Bind address for sse / streamable-http transports (default: 127.0.0.1).",
@@ -478,6 +613,14 @@ def main():
     # Reconfigure the module-level fetcher with the chosen backend.
     fetcher = WebContentFetcher(backend=args.fetch_backend)
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
+
+    # Reconfigure the module-level searcher if a backend was given on the CLI
+    # (otherwise it keeps the env-derived DDG_SEARCH_BACKEND default).
+    if args.search_backend is not None:
+        searcher = DuckDuckGoSearcher(
+            safe_search=safe_search, default_region=REGION_CODE, backend=args.search_backend
+        )
+        print(f"  Search backend: {searcher.backend}", file=sys.stderr)
 
     if transports == {"stdio"}:
         mcp.run(transport="stdio")
