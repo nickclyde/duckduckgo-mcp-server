@@ -49,6 +49,7 @@ Two MCP tools are exposed: `search` and `fetch_content`.
 Environment variables read at startup (not per-request):
 - `DDG_SAFE_SEARCH`: `STRICT` | `MODERATE` (default) | `OFF`
 - `DDG_REGION`: Region code like `us-en`, `cn-zh`, `jp-ja`, `wt-wt`
+- `DDG_ALLOW_PRIVATE_URLS`: `1`/`true` to let `fetch_content` reach loopback/private/link-local/metadata addresses (default off — SSRF guard). Also settable via `--allow-private-urls`.
 
 ## Testing
 

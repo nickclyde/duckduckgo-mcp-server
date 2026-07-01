@@ -10,7 +10,19 @@ import pytest_asyncio
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
+import duckduckgo_mcp_server.server as ddg_server
 from duckduckgo_mcp_server.server import mcp as mcp_app
+
+
+@pytest.fixture
+def allow_private_fetches():
+    """Let fetch_content reach the local test server (127.0.0.1) despite the SSRF guard."""
+    previous = ddg_server.fetcher.allow_private_urls
+    ddg_server.fetcher.allow_private_urls = True
+    try:
+        yield
+    finally:
+        ddg_server.fetcher.allow_private_urls = previous
 
 
 @pytest.fixture
@@ -78,7 +90,7 @@ async def test_server_lists_tools():
 
 
 @pytest.mark.asyncio
-async def test_fetch_content_tool_e2e(local_http_server):
+async def test_fetch_content_tool_e2e(local_http_server, allow_private_fetches):
     html = "<html><body><h1>Hello E2E</h1><p>Test content here.</p></body></html>"
     url = local_http_server(html)
 
@@ -114,7 +126,7 @@ async def test_search_tool_e2e(ddg_html_factory):
 
 
 @pytest.mark.asyncio
-async def test_fetch_content_tool_accepts_backend_param(local_http_server):
+async def test_fetch_content_tool_accepts_backend_param(local_http_server, allow_private_fetches):
     """The fetch_content tool should accept a per-call `backend` argument."""
     html = "<html><body><h1>Backend Param Test</h1></body></html>"
     url = local_http_server(html)

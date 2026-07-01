@@ -19,6 +19,8 @@ from duckduckgo_mcp_server.server import (
     SearchResult,
     SUPPORTED_FETCH_BACKENDS,
     WebContentFetcher,
+    BlockedURLError,
+    _validate_public_url,
 )
 
 try:
@@ -290,7 +292,8 @@ class TestWebContentFetcher(unittest.TestCase):
         try:
             for backend in _FETCH_BACKENDS_FOR_TESTING:
                 with self.subTest(backend=backend):
-                    fetcher = WebContentFetcher(backend=backend)
+                    # Local server is on 127.0.0.1, so opt into private URLs.
+                    fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
                     text = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
                     self.assertIn("Sample Heading", text)
                     self.assertIn("Some meaningful paragraph.", text)
@@ -305,7 +308,7 @@ class TestWebContentFetcher(unittest.TestCase):
         try:
             for backend in _FETCH_BACKENDS_FOR_TESTING:
                 with self.subTest(backend=backend):
-                    fetcher = WebContentFetcher(backend=backend)
+                    fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
                     # Fetch first 50 chars
                     text = asyncio.run(
                         fetcher.fetch_and_parse(url, DummyCtx(), start_index=0, max_length=50)
@@ -348,7 +351,8 @@ class TestWebContentFetcherErrors(unittest.TestCase):
     def test_fetch_returns_error_on_timeout(self):
         for backend in _FETCH_BACKENDS_FOR_TESTING:
             with self.subTest(backend=backend):
-                fetcher = WebContentFetcher(backend=backend)
+                # These mock the HTTP client; skip the SSRF guard (no real DNS).
+                fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
                 # Use an exception whose type-name triggers the server's curl-path
                 # error handling without needing curl_cffi's exception hierarchy.
                 exc = httpx.TimeoutException("timed out") if backend == "httpx" else TimeoutError("timed out")
@@ -362,7 +366,8 @@ class TestWebContentFetcherErrors(unittest.TestCase):
     def test_fetch_returns_error_on_http_error(self):
         for backend in _FETCH_BACKENDS_FOR_TESTING:
             with self.subTest(backend=backend):
-                fetcher = WebContentFetcher(backend=backend)
+                # These mock the HTTP client; skip the SSRF guard (no real DNS).
+                fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
                 mock_resp = MagicMock()
                 mock_resp.status_code = 500
                 mock_resp.request = MagicMock()
@@ -380,7 +385,8 @@ class TestWebContentFetcherErrors(unittest.TestCase):
     def test_fetch_handles_malformed_html(self):
         for backend in _FETCH_BACKENDS_FOR_TESTING:
             with self.subTest(backend=backend):
-                fetcher = WebContentFetcher(backend=backend)
+                # These mock the HTTP client; skip the SSRF guard (no real DNS).
+                fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
                 mock_resp = MagicMock()
                 mock_resp.text = "<<<not valid>>>"
                 mock_resp.status_code = 200
@@ -534,6 +540,88 @@ class TestWebContentFetcherAutoFallback(unittest.TestCase):
 
         self.assertEqual(called["curl"], 0)
         self.assertTrue(result.startswith("Error"))
+
+
+class TestSSRFGuard(unittest.TestCase):
+    def _assert_blocked(self, url):
+        with self.assertRaises(BlockedURLError):
+            asyncio.run(_validate_public_url(url))
+
+    def test_rejects_loopback_ip(self):
+        self._assert_blocked("http://127.0.0.1/")
+        self._assert_blocked("http://127.0.0.1:8080/latest/meta-data/")
+
+    def test_rejects_localhost_hostname(self):
+        self._assert_blocked("http://localhost/")
+        self._assert_blocked("https://sub.localhost/")
+
+    def test_rejects_cloud_metadata_ip(self):
+        self._assert_blocked("http://169.254.169.254/latest/meta-data/")
+
+    def test_rejects_private_ips(self):
+        for host in ("10.0.0.1", "192.168.1.1", "172.16.5.4"):
+            with self.subTest(host=host):
+                self._assert_blocked(f"http://{host}/")
+
+    def test_rejects_unspecified_and_ipv6_loopback(self):
+        self._assert_blocked("http://0.0.0.0/")
+        self._assert_blocked("http://[::1]/")
+
+    def test_rejects_ipv4_mapped_ipv6_loopback(self):
+        # Either resolves to an IPv4 loopback or fails to resolve — both are blocked.
+        self._assert_blocked("http://[::ffff:127.0.0.1]/")
+
+    def test_rejects_non_http_scheme(self):
+        self._assert_blocked("file:///etc/passwd")
+        self._assert_blocked("ftp://example.com/x")
+        self._assert_blocked("gopher://127.0.0.1/")
+
+    def test_allows_public_ip_literals(self):
+        # Public IPs must pass. IP literals avoid a real DNS lookup.
+        for url in ("http://1.1.1.1/", "https://8.8.8.8/"):
+            with self.subTest(url=url):
+                asyncio.run(_validate_public_url(url))  # must not raise
+
+    def test_fetch_content_blocks_localhost_by_default(self):
+        fetcher = WebContentFetcher()
+        result = asyncio.run(fetcher.fetch_and_parse("http://127.0.0.1:9/", DummyCtx()))
+        self.assertIn("Refusing to fetch", result)
+        self.assertIn("DDG_ALLOW_PRIVATE_URLS", result)
+
+    def test_fetch_content_blocks_metadata_by_default(self):
+        fetcher = WebContentFetcher()
+        result = asyncio.run(
+            fetcher.fetch_and_parse("http://169.254.169.254/latest/meta-data/", DummyCtx())
+        )
+        self.assertIn("Refusing to fetch", result)
+
+    def test_fetch_content_allows_private_when_opted_in(self):
+        html = "<html><body><h1>Internal OK</h1></body></html>"
+        url, stop = _serve_html(html)
+        try:
+            fetcher = WebContentFetcher(allow_private_urls=True)
+            result = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
+            self.assertIn("Internal OK", result)
+        finally:
+            stop()
+
+    def test_redirect_to_private_is_blocked(self):
+        """A public entry URL that 302-redirects to a private host is blocked mid-hop."""
+        fetcher = WebContentFetcher()  # default-deny
+        redirect_resp = MagicMock()
+        redirect_resp.status_code = 302
+        redirect_resp.headers = {"location": "http://127.0.0.1/secret"}
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=redirect_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = asyncio.run(fetcher.fetch_and_parse("http://1.1.1.1/", DummyCtx()))
+
+        self.assertIn("Refusing to fetch", result)
+        self.assertIn("127.0.0.1", result)
 
 
 def _setup_mock_mcp_for_http(mock_mcp):

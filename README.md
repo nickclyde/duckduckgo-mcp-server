@@ -226,6 +226,14 @@ Fetches and parses content from a webpage.
 **Returns:**
 Cleaned and formatted text content from the webpage.
 
+> **SSRF protection:** By default `fetch_content` refuses URLs that resolve to
+> loopback, private (RFC1918), link-local (including the `169.254.169.254` cloud
+> metadata endpoint), reserved, multicast, or unspecified addresses, and it
+> re-validates every redirect hop. Only `http`/`https` URLs are allowed. For
+> trusted local deployments that need to fetch internal hosts, disable the guard
+> with `DDG_ALLOW_PRIVATE_URLS=1` or `--allow-private-urls`. See
+> [SECURITY.md](SECURITY.md) for details.
+
 ## Features in Detail
 
 ### Rate Limiting

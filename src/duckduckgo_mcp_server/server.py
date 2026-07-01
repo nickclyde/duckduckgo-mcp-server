@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 import time
 import re
 import os
+import socket
+import ipaddress
 from enum import Enum
 
 
@@ -197,8 +199,74 @@ def _is_cloudflare_challenge_body(html: str) -> bool:
     return any(sig in sample for sig in _CLOUDFLARE_BODY_SIGNALS)
 
 
+# Maximum number of redirects fetch_content will follow. Each hop is re-validated
+# against the SSRF guard, so a public URL can't bounce us into the private network.
+_MAX_REDIRECTS = 5
+
+# HTTP status codes that carry a Location header we should follow.
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+class BlockedURLError(Exception):
+    """Raised when a fetch target is not an allowed public http(s) destination."""
+
+
+async def _validate_public_url(url: str) -> None:
+    """Reject non-public fetch targets (SSRF guard).
+
+    Enforces http/https and resolves the host, rejecting any URL that maps to a
+    loopback, private (RFC1918), link-local (incl. the 169.254.169.254 cloud
+    metadata endpoint), reserved, multicast, or unspecified address. Called on the
+    initial URL and on every redirect hop.
+
+    Note: this resolves the host and then lets the HTTP client resolve it again to
+    connect, so a determined attacker controlling DNS could rebind between the two
+    lookups (TOCTOU). Pinning the connection to the validated IP is out of scope;
+    default-deny plus per-hop validation blocks the practical SSRF vectors.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise BlockedURLError(
+            f"unsupported URL scheme '{parsed.scheme}://' (only http and https are allowed)"
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise BlockedURLError("URL has no host")
+
+    lowered = host.lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        raise BlockedURLError(f"refusing to fetch loopback host '{host}'")
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM
+        )
+    except socket.gaierror as e:
+        raise BlockedURLError(f"could not resolve host '{host}': {e}") from e
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) before classifying.
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise BlockedURLError(
+                f"refusing to fetch '{host}' — it resolves to non-public address {ip}"
+            )
+
+
 class WebContentFetcher:
-    def __init__(self, backend: str = "httpx"):
+    def __init__(self, backend: str = "httpx", allow_private_urls: bool = False):
         """
         Initialize the web content fetcher.
 
@@ -211,30 +279,54 @@ class WebContentFetcher:
                 `pip install 'duckduckgo-mcp-server[browser]'`.
               - "auto": try httpx first; if the response looks like a 403 or a
                 Cloudflare challenge, transparently retry with curl.
+            allow_private_urls: When False (default), fetch_content refuses URLs that
+                resolve to loopback/private/link-local/metadata addresses (SSRF guard).
+                Set True only for trusted local deployments that intentionally fetch
+                internal hosts.
         """
         if backend not in SUPPORTED_FETCH_BACKENDS:
             raise ValueError(
                 f"Unknown fetch backend '{backend}'. Supported: {SUPPORTED_FETCH_BACKENDS}"
             )
         self.default_backend = backend
+        self.allow_private_urls = allow_private_urls
         self.rate_limiter = RateLimiter(requests_per_minute=20)
 
+    async def _guard_url(self, url: str) -> None:
+        """Apply the SSRF guard unless private URLs are explicitly allowed."""
+        if not self.allow_private_urls:
+            await _validate_public_url(url)
+
     async def _fetch_httpx(self, url: str) -> str:
-        """Fetch URL via httpx. Raises httpx.HTTPStatusError on non-2xx."""
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                },
-                follow_redirects=True,
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            return response.text
+        """Fetch URL via httpx, validating the target and every redirect hop.
+
+        Redirects are followed manually (not via follow_redirects=True) so the SSRF
+        guard runs on each hop. Raises httpx.HTTPStatusError on non-2xx.
+        """
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            current = url
+            for _ in range(_MAX_REDIRECTS + 1):
+                await self._guard_url(current)
+                response = await client.get(
+                    current,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    },
+                    timeout=30.0,
+                )
+                location = response.headers.get("location")
+                if response.status_code in _REDIRECT_STATUSES and location:
+                    current = str(httpx.URL(current).join(location))
+                    continue
+                response.raise_for_status()
+                return response.text
+            raise httpx.HTTPError(f"too many redirects (>{_MAX_REDIRECTS})")
 
     async def _fetch_curl(self, url: str) -> str:
-        """Fetch URL via curl_cffi with Chrome 131 TLS impersonation."""
+        """Fetch URL via curl_cffi with Chrome 131 TLS impersonation.
+
+        Redirects are followed manually so the SSRF guard runs on each hop.
+        """
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError as e:
@@ -243,9 +335,17 @@ class WebContentFetcher:
                 "Install the optional extra: pip install 'duckduckgo-mcp-server[browser]'"
             ) from e
         async with AsyncSession(impersonate="chrome131") as client:
-            response = await client.get(url, allow_redirects=True, timeout=30.0)
-            response.raise_for_status()
-            return response.text
+            current = url
+            for _ in range(_MAX_REDIRECTS + 1):
+                await self._guard_url(current)
+                response = await client.get(current, allow_redirects=False, timeout=30.0)
+                location = response.headers.get("location")
+                if response.status_code in _REDIRECT_STATUSES and location:
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                return response.text
+            raise httpx.HTTPError(f"too many redirects (>{_MAX_REDIRECTS})")
 
     async def _fetch_auto(self, url: str, ctx: Context) -> str:
         """
@@ -340,6 +440,13 @@ class WebContentFetcher:
             )
             return text
 
+        except BlockedURLError as e:
+            await ctx.error(f"Blocked fetch for {url}: {e}")
+            return (
+                f"Error: Refusing to fetch {url} ({e}). This server blocks requests to "
+                "private/internal addresses to prevent SSRF. If this is a trusted local "
+                "deployment, set DDG_ALLOW_PRIVATE_URLS=1 (or pass --allow-private-urls)."
+            )
         except httpx.TimeoutException:
             await ctx.error(f"Request timed out for URL: {url}")
             return "Error: The request timed out while trying to fetch the webpage."
@@ -365,9 +472,15 @@ class WebContentFetcher:
 # Initialize FastMCP server
 mcp = FastMCP("ddg-search")
 
+def _env_flag(name: str) -> bool:
+    """True when the named env var is set to a truthy string (1/true/yes/on)."""
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Read configuration from environment variables
 SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
+ALLOW_PRIVATE_URLS = _env_flag("DDG_ALLOW_PRIVATE_URLS")
 
 # Validate and set SafeSearch mode
 try:
@@ -377,7 +490,7 @@ except KeyError:
     safe_search = SafeSearchMode.MODERATE
 
 searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
-fetcher = WebContentFetcher()
+fetcher = WebContentFetcher(allow_private_urls=ALLOW_PRIVATE_URLS)
 
 print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
@@ -455,6 +568,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allow-private-urls",
+        action="store_true",
+        help=(
+            "Allow fetch_content to reach loopback/private/link-local/metadata "
+            "addresses. Off by default (SSRF guard). Enable only for trusted local "
+            "deployments. Also settable via DDG_ALLOW_PRIVATE_URLS=1."
+        ),
+    )
+    parser.add_argument(
         "--host",
         default=None,
         help="Bind address for sse / streamable-http transports (default: 127.0.0.1).",
@@ -475,9 +597,12 @@ def main():
     if transports == {"stdio"} and (args.host is not None or args.port is not None):
         parser.error("--host / --port are only valid with --transport sse or streamable-http")
 
-    # Reconfigure the module-level fetcher with the chosen backend.
-    fetcher = WebContentFetcher(backend=args.fetch_backend)
+    # Reconfigure the module-level fetcher with the chosen backend. Private-URL
+    # access is enabled if either the env var or the CLI flag is set.
+    allow_private = ALLOW_PRIVATE_URLS or args.allow_private_urls
+    fetcher = WebContentFetcher(backend=args.fetch_backend, allow_private_urls=allow_private)
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
+    print(f"  Allow private URLs: {fetcher.allow_private_urls}", file=sys.stderr)
 
     if transports == {"stdio"}:
         mcp.run(transport="stdio")
