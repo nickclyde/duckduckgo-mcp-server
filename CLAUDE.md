@@ -51,6 +51,7 @@ Environment variables read at startup (not per-request):
 - `DDG_REGION`: Region code like `us-en`, `cn-zh`, `jp-ja`, `wt-wt`
 - `DDG_ALLOW_PRIVATE_URLS`: `1`/`true` to let `fetch_content` reach loopback/private/link-local/metadata addresses (default off — SSRF guard). Also settable via `--allow-private-urls`.
 - `DDG_SEARCH_BACKEND`: `auto` (default) | `httpx` | `curl` — HTTP backend for the search tool. `auto` falls back to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a fingerprint block (HTTP 202/403); `curl`/fallback need the `[browser]` extra. Also settable via `--search-backend`.
+- `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
 
 ## Testing
 

@@ -630,11 +630,39 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _split_env_list(name: str) -> list:
+    """Parse a comma-separated env var into a list of trimmed, non-empty items."""
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def _build_transport_security(allowed_hosts, allowed_origins, disable):
+    """Build TransportSecuritySettings for HTTP transports, or None to keep defaults.
+
+    Returns None when nothing is configured (so FastMCP's secure localhost default is
+    preserved). When an allow-list is given, DNS rebinding protection stays on but the
+    supplied Host/Origin values are permitted — the fix for 421 Misdirected Request
+    behind a reverse proxy / in Docker (issue #45). `disable` turns the protection off
+    entirely (less safe; prefer an allow-list).
+    """
+    if not (allowed_hosts or allowed_origins or disable):
+        return None
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=not disable,
+        allowed_hosts=list(allowed_hosts or []),
+        allowed_origins=list(allowed_origins or []),
+    )
+
+
 # Read configuration from environment variables
 SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
 ALLOW_PRIVATE_URLS = _env_flag("DDG_ALLOW_PRIVATE_URLS")
 SEARCH_BACKEND = os.getenv("DDG_SEARCH_BACKEND", "auto").lower()
+ALLOWED_HOSTS = _split_env_list("DDG_ALLOWED_HOSTS")
+ALLOWED_ORIGINS = _split_env_list("DDG_ALLOWED_ORIGINS")
+DISABLE_DNS_REBINDING = _env_flag("DDG_DISABLE_DNS_REBINDING_PROTECTION")
 
 # Validate and set SafeSearch mode
 try:
@@ -759,6 +787,39 @@ def main():
         default=None,
         help="Bind port for sse / streamable-http transports (default: 8000).",
     )
+    parser.add_argument(
+        "--allowed-hosts",
+        nargs="+",
+        default=None,
+        metavar="HOST",
+        help=(
+            "Allowed Host header values for sse / streamable-http (DNS rebinding "
+            "protection). Accepts 'host', 'host:port', or 'host:*'. Set this (and/or "
+            "--allowed-origins) when running behind a reverse proxy or in Docker to "
+            "avoid 421 Misdirected Request. Also settable via DDG_ALLOWED_HOSTS "
+            "(comma-separated). Only affects HTTP transports."
+        ),
+    )
+    parser.add_argument(
+        "--allowed-origins",
+        nargs="+",
+        default=None,
+        metavar="ORIGIN",
+        help=(
+            "Allowed Origin header values for sse / streamable-http (e.g. "
+            "'http://example.com:*'). Also settable via DDG_ALLOWED_ORIGINS "
+            "(comma-separated). Only affects HTTP transports."
+        ),
+    )
+    parser.add_argument(
+        "--disable-dns-rebinding-protection",
+        action="store_true",
+        help=(
+            "Disable Host/Origin validation for sse / streamable-http entirely. Less "
+            "safe than an allow-list; prefer --allowed-hosts / --allowed-origins. Also "
+            "settable via DDG_DISABLE_DNS_REBINDING_PROTECTION=1."
+        ),
+    )
     args = parser.parse_args()
 
     transports = set(args.transport)
@@ -791,6 +852,22 @@ def main():
         port = args.port or 8000
         mcp.settings.host = host
         mcp.settings.port = port
+
+        # Configure DNS-rebinding protection. By default FastMCP only allows
+        # localhost Host/Origin headers, which yields 421 Misdirected Request behind
+        # a reverse proxy / in Docker (issue #45). Applying an allow-list (or an
+        # explicit disable) here overrides that before the apps are built.
+        allowed_hosts = args.allowed_hosts if args.allowed_hosts is not None else ALLOWED_HOSTS
+        allowed_origins = args.allowed_origins if args.allowed_origins is not None else ALLOWED_ORIGINS
+        disable_dns = args.disable_dns_rebinding_protection or DISABLE_DNS_REBINDING
+        transport_security = _build_transport_security(allowed_hosts, allowed_origins, disable_dns)
+        if transport_security is not None:
+            mcp.settings.transport_security = transport_security
+            print(
+                f"  Transport security: dns_rebinding_protection={not disable_dns}, "
+                f"allowed_hosts={allowed_hosts or '[]'}, allowed_origins={allowed_origins or '[]'}",
+                file=sys.stderr,
+            )
 
         # SSE and Streamable HTTP app setup
         sse_app = mcp.sse_app()

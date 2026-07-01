@@ -107,6 +107,22 @@ When running with `sse` or `streamable-http`, override the default bind address 
 uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 ```
 
+#### Running behind a reverse proxy or in Docker
+
+FastMCP enables DNS-rebinding protection for the HTTP transports and, by default, only accepts `Host`/`Origin` headers for `localhost`. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+
+Fix it by allow-listing the host(s) and origin(s) clients actually use (preferred over disabling protection). Values support `host`, `host:port`, and wildcard-port `host:*`:
+
+```bash
+uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070 \
+  --allowed-hosts ddg-mcp.example.com "ddg-mcp.example.com:*" \
+  --allowed-origins "https://ddg-mcp.example.com"
+```
+
+Equivalent environment variables (comma-separated) are also available: `DDG_ALLOWED_HOSTS`, `DDG_ALLOWED_ORIGINS`.
+
+As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks. When nothing is configured, the secure localhost-only default is preserved.
+
 ### Backends (bypassing bot detection)
 
 Some sites — and, as of recently, DuckDuckGo's own search endpoint (`html.duckduckgo.com`) — block the default `httpx` client because of its distinctive TLS fingerprint, regardless of User-Agent. Cloudflare Bot Management and similar filters key on the JA3/TLS handshake, not on headers, so `html.duckduckgo.com` may answer `httpx` with an empty **HTTP 202** page (silently yielding "no results"). An opt-in backend, `curl` (implemented via `curl_cffi`), impersonates a real Chrome browser's TLS handshake and passes through those checks.
