@@ -1,5 +1,7 @@
 # DuckDuckGo Search MCP Server
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fnickclyde%2Fduckduckgo-mcp-server.svg)](https://mcptoplist.com/server/glama%2Fnickclyde%2Fduckduckgo-mcp-server)
+
 [![PyPI version](https://img.shields.io/pypi/v/duckduckgo-mcp-server)](https://pypi.org/project/duckduckgo-mcp-server/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/duckduckgo-mcp-server)](https://pypi.org/project/duckduckgo-mcp-server/)
 [![Python versions](https://img.shields.io/pypi/pyversions/duckduckgo-mcp-server)](https://pypi.org/project/duckduckgo-mcp-server/)
