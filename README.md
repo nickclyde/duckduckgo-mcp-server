@@ -78,6 +78,7 @@ Add the following configuration:
   - `jp-ja`: Japan (Japanese)
   - `wt-wt`: No specific region
   - Leave empty for DuckDuckGo's default behavior
+- `DDG_CA_CERTS`: Path to a PEM CA bundle used to verify TLS certificates on outbound requests (optional). Needed behind TLS-intercepting proxies — see [Running behind a TLS-intercepting proxy](#running-behind-a-tls-intercepting-proxy).
 
 3. Restart Claude Desktop
 
@@ -122,6 +123,18 @@ uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 Equivalent environment variables (comma-separated) are also available: `DDG_ALLOWED_HOSTS`, `DDG_ALLOWED_ORIGINS`.
 
 As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks. When nothing is configured, the secure localhost-only default is preserved.
+
+#### Running behind a TLS-intercepting proxy
+
+Corporate proxies that re-sign HTTPS traffic with their own CA (via `HTTPS_PROXY`) cause outbound requests to fail with certificate verification errors, because the HTTP clients don't trust the proxy's self-signed CA (and httpx no longer reads the `SSL_CERT_FILE` environment variable). Point the server at your proxy's CA bundle:
+
+```bash
+uvx duckduckgo-mcp-server --ca-certs /path/to/proxy-ca.pem
+```
+
+Or set `DDG_CA_CERTS=/path/to/proxy-ca.pem`. The bundle is used by both the `search` and `fetch_content` tools, on the httpx and curl backends alike.
+
+As a last resort, `--no-ssl-verify` (or `DDG_SSL_VERIFY=0`) disables certificate verification entirely. This exposes traffic to interception by anyone on the network path — prefer `--ca-certs`.
 
 ### Backends (bypassing bot detection)
 

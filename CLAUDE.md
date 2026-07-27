@@ -58,11 +58,12 @@ Environment variables read at startup (not per-request):
 - `DDG_ALLOW_PRIVATE_URLS`: `1`/`true` to let `fetch_content` reach loopback/private/link-local/metadata addresses (default off — SSRF guard). Also settable via `--allow-private-urls`.
 - `DDG_SEARCH_BACKEND`: `auto` (default) | `httpx` | `curl` — HTTP backend for the search tool. `auto` falls back to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a fingerprint block (HTTP 202/403); `curl`/fallback need the `[browser]` extra. Also settable via `--search-backend`.
 - `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
+- `DDG_CA_CERTS`: path to a PEM CA bundle for verifying TLS on outbound requests (needed behind TLS-intercepting proxies — httpx no longer reads `SSL_CERT_FILE`). `DDG_SSL_VERIFY=0` disables verification entirely (discouraged). Also `--ca-certs` / `--no-ssl-verify`. Applies to all four client sites (httpx + curl_cffi, search + fetch).
 
 ## Testing
 
-- **Unit tests** (`test_server.py`): 21 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
-- **E2E tests** (`test_e2e.py`): 4 tests using `pytest-asyncio` with MCP SDK's `create_connected_server_and_client_session` from `mcp.shared.memory` for in-memory MCP client/server testing.
+- **Unit tests** (`test_server.py`): 78 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
+- **E2E tests** (`test_e2e.py`): 6 tests using `pytest-asyncio` with MCP SDK's `create_connected_server_and_client_session` from `mcp.shared.memory` for in-memory MCP client/server testing.
 - **CI**: GitHub Actions (`.github/workflows/test.yml`) runs a `test` job (pytest on Python 3.10–3.14) and a `quality` job (`ruff check` — blocking — plus a non-blocking `pip-audit` dependency scan), all using `astral-sh/setup-uv`.
 
 ## Key Dependencies

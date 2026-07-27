@@ -106,6 +106,7 @@ class DuckDuckGoSearcher:
         safe_search: SafeSearchMode = SafeSearchMode.MODERATE,
         default_region: str = "",
         backend: str = "auto",
+        ssl_verify=True,
     ):
         """
         Initialize DuckDuckGo searcher
@@ -118,6 +119,9 @@ class DuckDuckGoSearcher:
                 to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a
                 fingerprint-based block (HTTP 202/403). "curl" and the auto fallback
                 require the optional [browser] extra.
+            ssl_verify: TLS verification passed to the HTTP clients: True (default
+                trust store), a path to a CA bundle (e.g. a TLS-intercepting proxy's
+                CA), or False to disable verification.
         """
         if backend not in SUPPORTED_FETCH_BACKENDS:
             raise ValueError(
@@ -127,6 +131,7 @@ class DuckDuckGoSearcher:
         self.safe_search = safe_search
         self.default_region = default_region
         self.backend = backend
+        self.ssl_verify = ssl_verify
 
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
         """Format results in a natural language style that's easier for LLMs to process"""
@@ -298,7 +303,7 @@ class DuckDuckGoSearcher:
         Note: a fingerprint-blocked response is HTTP 202 (a 2xx), so
         ``raise_for_status()`` does not fire — the caller inspects the status.
         """
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             response = await client.post(
                 self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
             )
@@ -316,7 +321,7 @@ class DuckDuckGoSearcher:
             ) from e
         # Let curl_cffi supply the impersonated browser headers for a consistent
         # Chrome fingerprint; we only send the search form fields.
-        async with AsyncSession(impersonate="chrome131") as client:
+        async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
             response = await client.post(self.BASE_URL, data=data, timeout=30.0)
             response.raise_for_status()
             return response.text
@@ -418,7 +423,7 @@ async def _validate_public_url(url: str) -> None:
 
 
 class WebContentFetcher:
-    def __init__(self, backend: str = "httpx", allow_private_urls: bool = False):
+    def __init__(self, backend: str = "httpx", allow_private_urls: bool = False, ssl_verify=True):
         """
         Initialize the web content fetcher.
 
@@ -435,6 +440,9 @@ class WebContentFetcher:
                 resolve to loopback/private/link-local/metadata addresses (SSRF guard).
                 Set True only for trusted local deployments that intentionally fetch
                 internal hosts.
+            ssl_verify: TLS verification passed to the HTTP clients: True (default
+                trust store), a path to a CA bundle (e.g. a TLS-intercepting proxy's
+                CA), or False to disable verification.
         """
         if backend not in SUPPORTED_FETCH_BACKENDS:
             raise ValueError(
@@ -442,6 +450,7 @@ class WebContentFetcher:
             )
         self.default_backend = backend
         self.allow_private_urls = allow_private_urls
+        self.ssl_verify = ssl_verify
         self.rate_limiter = RateLimiter(requests_per_minute=20)
 
     async def _guard_url(self, url: str) -> None:
@@ -455,7 +464,7 @@ class WebContentFetcher:
         Redirects are followed manually (not via follow_redirects=True) so the SSRF
         guard runs on each hop. Raises httpx.HTTPStatusError on non-2xx.
         """
-        async with httpx.AsyncClient(follow_redirects=False) as client:
+        async with httpx.AsyncClient(follow_redirects=False, verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
                 await self._guard_url(current)
@@ -486,7 +495,7 @@ class WebContentFetcher:
                 "The 'curl' fetch backend requires curl_cffi, which is not installed. "
                 "Install the optional extra: pip install 'duckduckgo-mcp-server[browser]'"
             ) from e
-        async with AsyncSession(impersonate="chrome131") as client:
+        async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
                 await self._guard_url(current)
@@ -634,6 +643,21 @@ def _split_env_list(name: str) -> list:
     return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
 
 
+def _resolve_ssl_verify(ca_certs: str, verify_enabled: bool = True):
+    """Return the value to pass as ``verify=`` to the outbound HTTP clients.
+
+    False disables certificate verification entirely (insecure escape hatch); a CA
+    bundle path makes the clients trust that bundle — needed behind TLS-intercepting
+    proxies with a self-signed CA, which httpx otherwise rejects since it no longer
+    reads SSL_CERT_FILE (issue #54); True keeps each client's default trust store.
+    """
+    if not verify_enabled:
+        return False
+    if ca_certs:
+        return ca_certs
+    return True
+
+
 def _build_transport_security(allowed_hosts, allowed_origins, disable):
     """Build TransportSecuritySettings for HTTP transports, or None to keep defaults.
 
@@ -662,6 +686,12 @@ SEARCH_BACKEND = os.getenv("DDG_SEARCH_BACKEND", "auto").lower()
 ALLOWED_HOSTS = _split_env_list("DDG_ALLOWED_HOSTS")
 ALLOWED_ORIGINS = _split_env_list("DDG_ALLOWED_ORIGINS")
 DISABLE_DNS_REBINDING = _env_flag("DDG_DISABLE_DNS_REBINDING_PROTECTION")
+CA_CERTS = os.getenv("DDG_CA_CERTS", "").strip()
+SSL_VERIFY_ENABLED = os.getenv("DDG_SSL_VERIFY", "1").strip().lower() not in ("0", "false", "no", "off")
+SSL_VERIFY = _resolve_ssl_verify(CA_CERTS, SSL_VERIFY_ENABLED)
+
+if CA_CERTS and not os.path.isfile(CA_CERTS):
+    print(f"Warning: DDG_CA_CERTS path '{CA_CERTS}' does not exist; TLS requests will fail", file=sys.stderr)
 
 # Validate and set SafeSearch mode
 try:
@@ -675,13 +705,17 @@ if SEARCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
     print(f"Warning: Invalid DDG_SEARCH_BACKEND value '{SEARCH_BACKEND}', using auto", file=sys.stderr)
     SEARCH_BACKEND = "auto"
 
-searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE, backend=SEARCH_BACKEND)
-fetcher = WebContentFetcher(allow_private_urls=ALLOW_PRIVATE_URLS)
+searcher = DuckDuckGoSearcher(
+    safe_search=safe_search, default_region=REGION_CODE, backend=SEARCH_BACKEND, ssl_verify=SSL_VERIFY
+)
+fetcher = WebContentFetcher(allow_private_urls=ALLOW_PRIVATE_URLS, ssl_verify=SSL_VERIFY)
 
 print("DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
 print(f"  Search backend: {searcher.backend}", file=sys.stderr)
+if SSL_VERIFY is not True:
+    print(f"  SSL verify: {SSL_VERIFY}", file=sys.stderr)
 
 
 @mcp.tool()
@@ -776,6 +810,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ca-certs",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a PEM CA bundle used to verify TLS certificates on outbound "
+            "requests (search and fetch_content). Needed behind TLS-intercepting "
+            "proxies that re-sign traffic with their own CA. Also settable via "
+            "DDG_CA_CERTS."
+        ),
+    )
+    parser.add_argument(
+        "--no-ssl-verify",
+        action="store_true",
+        help=(
+            "Disable TLS certificate verification on outbound requests entirely. "
+            "Insecure; prefer --ca-certs with your proxy's CA bundle. Also settable "
+            "via DDG_SSL_VERIFY=0."
+        ),
+    )
+    parser.add_argument(
         "--host",
         default=None,
         help="Bind address for sse / streamable-http transports (default: 127.0.0.1).",
@@ -829,18 +883,32 @@ def main():
     if transports == {"stdio"} and (args.host is not None or args.port is not None):
         parser.error("--host / --port are only valid with --transport sse or streamable-http")
 
+    if args.ca_certs is not None and not os.path.isfile(args.ca_certs):
+        parser.error(f"--ca-certs path '{args.ca_certs}' does not exist")
+
+    # CLI flags override the env-derived SSL settings.
+    ca_certs = args.ca_certs if args.ca_certs is not None else CA_CERTS
+    ssl_verify = _resolve_ssl_verify(ca_certs, SSL_VERIFY_ENABLED and not args.no_ssl_verify)
+
     # Reconfigure the module-level fetcher with the chosen backend. Private-URL
     # access is enabled if either the env var or the CLI flag is set.
     allow_private = ALLOW_PRIVATE_URLS or args.allow_private_urls
-    fetcher = WebContentFetcher(backend=args.fetch_backend, allow_private_urls=allow_private)
+    fetcher = WebContentFetcher(
+        backend=args.fetch_backend, allow_private_urls=allow_private, ssl_verify=ssl_verify
+    )
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
     print(f"  Allow private URLs: {fetcher.allow_private_urls}", file=sys.stderr)
+    if ssl_verify is not True:
+        print(f"  SSL verify: {ssl_verify}", file=sys.stderr)
 
-    # Reconfigure the module-level searcher if a backend was given on the CLI
-    # (otherwise it keeps the env-derived DDG_SEARCH_BACKEND default).
-    if args.search_backend is not None:
+    # Reconfigure the module-level searcher if a backend or SSL setting was given on
+    # the CLI (otherwise it keeps the env-derived defaults).
+    if args.search_backend is not None or ssl_verify != searcher.ssl_verify:
         searcher = DuckDuckGoSearcher(
-            safe_search=safe_search, default_region=REGION_CODE, backend=args.search_backend
+            safe_search=safe_search,
+            default_region=REGION_CODE,
+            backend=args.search_backend or searcher.backend,
+            ssl_verify=ssl_verify,
         )
         print(f"  Search backend: {searcher.backend}", file=sys.stderr)
 
