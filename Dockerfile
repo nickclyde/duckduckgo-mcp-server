@@ -7,5 +7,6 @@ COPY . /app
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 
-# MCP uses stdio, no port to expose.
-CMD ["python", "-m", "duckduckgo_mcp_server.server"]
+# Updated to allow command-line switches to be passed via docker commands
+ENTRYPOINT ["python", "-m", "duckduckgo_mcp_server.server"]
+CMD []
