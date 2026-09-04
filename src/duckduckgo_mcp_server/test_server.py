@@ -63,13 +63,20 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
         now = datetime.now()
         limiter.requests = [now - timedelta(seconds=10), now - timedelta(seconds=5)]
 
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        async def fake_sleep(seconds):
+            # Advance the window the same way a real wait would.
+            limiter.requests = [
+                t - timedelta(seconds=seconds + 0.1) for t in limiter.requests
+            ]
+
+        with patch("asyncio.sleep", side_effect=fake_sleep) as mock_sleep:
             asyncio.run(limiter.acquire())
-            mock_sleep.assert_called_once()
-            # Should wait roughly 50 seconds (60 - 10)
-            wait_time = mock_sleep.call_args[0][0]
+            mock_sleep.assert_called()
+            wait_time = mock_sleep.call_args_list[0][0][0]
             self.assertGreater(wait_time, 40)
             self.assertLessEqual(wait_time, 60)
+            # Recorded after the wait, so we stay at the cap instead of rpm+1.
+            self.assertEqual(len(limiter.requests), 2)
 
     def test_acquire_allows_after_window_expires(self):
         limiter = RateLimiter(requests_per_minute=2)
@@ -108,12 +115,20 @@ class TestTokenBucketAndHostLimits(unittest.TestCase):
 
     def test_host_limiter_isolates_hosts(self):
         limiter = HostRateLimiter("sliding", requests_per_minute=1)
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+
+        async def fake_sleep(seconds):
+            # Age past the 60s window so wait-then-record can take a slot.
+            extra = max(seconds, 0) + 0.1
+            for child in limiter._limiters.values():
+                if hasattr(child, "requests"):
+                    child.requests = [t - timedelta(seconds=extra) for t in child.requests]
+
+        with patch("asyncio.sleep", side_effect=fake_sleep) as mock_sleep:
             asyncio.run(limiter.acquire("https://a.example/1"))
             asyncio.run(limiter.acquire("https://b.example/1"))
             mock_sleep.assert_not_called()
             asyncio.run(limiter.acquire("https://a.example/2"))
-            mock_sleep.assert_called_once()
+            mock_sleep.assert_called()
 
     def test_retry_after_seconds(self):
         self.assertEqual(_retry_after_seconds({"retry-after": "5"}), 5.0)

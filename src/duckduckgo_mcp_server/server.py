@@ -44,17 +44,28 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self):
-        wait_time = 0.0
-        async with self._lock:
-            now = datetime.now()
-            self.requests = [
-                req for req in self.requests if now - req < timedelta(minutes=1)
-            ]
-            if len(self.requests) >= self.requests_per_minute:
+        # Wait, then record. Recording before sleep let the window grow past
+        # rpm and stamped requests at the pre-wait time (review finding).
+        while True:
+            wait_time = 0.0
+            async with self._lock:
+                now = datetime.now()
+                self.requests = [
+                    req for req in self.requests if now - req < timedelta(minutes=1)
+                ]
+                if len(self.requests) < self.requests_per_minute:
+                    self.requests.append(now)
+                    return
                 wait_time = 60 - (now - self.requests[0]).total_seconds()
-            self.requests.append(now)
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            else:
+                # Oldest entry is at or past the window but still listed
+                # (same-timestamp pile-up / clock resolution). Drop it so we
+                # cannot spin on sleep(0).
+                async with self._lock:
+                    if self.requests:
+                        self.requests.pop(0)
 
 
 class TokenBucketLimiter:
