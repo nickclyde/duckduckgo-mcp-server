@@ -67,6 +67,11 @@ class RateLimiter:
                     if self.requests:
                         self.requests.pop(0)
 
+    def idle(self) -> bool:
+        """True when no request falls inside the current 60s window."""
+        now = datetime.now()
+        return not any(now - req < timedelta(minutes=1) for req in self.requests)
+
 
 class TokenBucketLimiter:
     """Token-bucket limiter: allows a short burst, then smooths to ``rpm``.
@@ -88,6 +93,11 @@ class TokenBucketLimiter:
         elapsed = now - self.updated
         self.updated = now
         self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+
+    def idle(self) -> bool:
+        """True when the bucket has refilled to its burst capacity."""
+        self._refill()
+        return self.tokens >= self.burst
 
     async def acquire(self):
         wait_time = 0.0
@@ -123,6 +133,10 @@ class HostRateLimiter:
     async def acquire(self, url: str) -> None:
         host = (urllib.parse.urlsplit(url).hostname or "").lower() or "unknown"
         async with self._lock:
+            # Drop limiters for hosts that have gone quiet so the map does not
+            # grow by one entry per distinct host for the life of the server.
+            for stale in [h for h, lim in self._limiters.items() if h != host and lim.idle()]:
+                del self._limiters[stale]
             limiter = self._limiters.get(host)
             if limiter is None:
                 limiter = make_rate_limiter(self.strategy, self.requests_per_minute)
@@ -544,7 +558,7 @@ class WebContentFetcher:
         allow_private_urls: bool = False,
         ssl_verify=True,
         requests_per_minute: int = 20,
-        host_requests_per_minute: int = 10,
+        host_requests_per_minute: int = 0,
         rate_limit_strategy: str = "sliding",
     ):
         """
@@ -567,7 +581,7 @@ class WebContentFetcher:
                 trust store), a path to a CA bundle (e.g. a TLS-intercepting proxy's
                 CA), or False to disable verification.
             requests_per_minute: Global fetch rate-limit cap (default 20).
-            host_requests_per_minute: Extra per-host cap (default 10). 0 disables.
+            host_requests_per_minute: Optional per-host cap. 0 (default) disables it.
             rate_limit_strategy: "sliding" (default) or "token_bucket".
         """
         if backend not in SUPPORTED_FETCH_BACKENDS:
@@ -853,7 +867,7 @@ SSL_VERIFY_ENABLED = os.getenv("DDG_SSL_VERIFY", "1").strip().lower() not in ("0
 SSL_VERIFY = _resolve_ssl_verify(CA_CERTS, SSL_VERIFY_ENABLED)
 SEARCH_RPM = _env_int("DDG_SEARCH_RPM", 30, minimum=1)
 FETCH_RPM = _env_int("DDG_FETCH_RPM", 20, minimum=1)
-FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 10, minimum=0)
+FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 0, minimum=0)
 RATE_LIMIT_STRATEGY = os.getenv("DDG_RATE_LIMIT_STRATEGY", "sliding").strip().lower() or "sliding"
 
 if CA_CERTS and not os.path.isfile(CA_CERTS):
@@ -1047,8 +1061,8 @@ def main():
         default=None,
         metavar="N",
         help=(
-            "Per-host fetch_content cap (default: 10, or DDG_FETCH_HOST_RPM). "
-            "Set 0 to disable the extra per-host limiter."
+            "Optional per-host fetch_content cap so one site cannot use the whole "
+            "fetch budget (default: 0, off; or DDG_FETCH_HOST_RPM)."
         ),
     )
     parser.add_argument(

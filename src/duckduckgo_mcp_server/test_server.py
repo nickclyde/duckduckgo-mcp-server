@@ -130,6 +130,29 @@ class TestTokenBucketAndHostLimits(unittest.TestCase):
             asyncio.run(limiter.acquire("https://a.example/2"))
             mock_sleep.assert_called()
 
+    def test_host_limiter_evicts_idle_hosts(self):
+        limiter = HostRateLimiter("sliding", requests_per_minute=5)
+        asyncio.run(limiter.acquire("https://a.example/1"))
+        asyncio.run(limiter.acquire("https://b.example/1"))
+        self.assertEqual(set(limiter._limiters), {"a.example", "b.example"})
+        # Age a.example's only request out of the window; the next acquire prunes it.
+        limiter._limiters["a.example"].requests = [datetime.now() - timedelta(seconds=61)]
+        asyncio.run(limiter.acquire("https://c.example/1"))
+        self.assertNotIn("a.example", limiter._limiters)
+        self.assertIn("b.example", limiter._limiters)
+        self.assertIn("c.example", limiter._limiters)
+
+    def test_token_bucket_idle_after_refill(self):
+        limiter = TokenBucketLimiter(requests_per_minute=60, burst=1)
+        asyncio.run(limiter.acquire())
+        self.assertFalse(limiter.idle())
+        limiter.updated -= 5  # pretend 5s passed: refills the single-token bucket
+        self.assertTrue(limiter.idle())
+
+    def test_fetcher_host_limiter_off_by_default(self):
+        self.assertIsNone(WebContentFetcher().host_limiter)
+        self.assertIsNotNone(WebContentFetcher(host_requests_per_minute=5).host_limiter)
+
     def test_retry_after_seconds(self):
         self.assertEqual(_retry_after_seconds({"retry-after": "5"}), 5.0)
         self.assertIsNone(_retry_after_seconds({"retry-after": "Fri, 01 Jan 2030"}))
