@@ -79,6 +79,10 @@ Add the following configuration:
   - `wt-wt`: No specific region
   - Leave empty for DuckDuckGo's default behavior
 - `DDG_CA_CERTS`: Path to a PEM CA bundle used to verify TLS certificates on outbound requests (optional). Needed behind TLS-intercepting proxies — see [Running behind a TLS-intercepting proxy](#running-behind-a-tls-intercepting-proxy).
+- `DDG_RATE_LIMIT_STRATEGY`: `sliding` (default, historical 60s window) or `token_bucket` (burst, then smooth).
+- `DDG_SEARCH_RPM`: Search requests per minute (default: `30`).
+- `DDG_FETCH_RPM`: Global `fetch_content` requests per minute (default: `20`).
+- `DDG_FETCH_HOST_RPM`: Extra per-host fetch cap (default: `10`). Set `0` to disable.
 
 3. Restart Claude Desktop
 
@@ -284,9 +288,11 @@ Cleaned and formatted text content from the webpage.
 
 ### Rate Limiting
 
-- Search: Limited to 30 requests per minute
-- Content Fetching: Limited to 20 requests per minute
-- Automatic queue management and wait times
+- Search: 30 requests per minute by default (`DDG_SEARCH_RPM` / `--search-rpm`)
+- Content fetching: 20 requests per minute globally (`DDG_FETCH_RPM` / `--fetch-rpm`)
+- Extra per-host fetch cap: 10 requests per minute (`DDG_FETCH_HOST_RPM` / `--fetch-host-rpm`, `0` disables)
+- Strategies: `sliding` (default) or `token_bucket` via `DDG_RATE_LIMIT_STRATEGY` / `--rate-limit-strategy`
+- HTTP 429 responses honor `Retry-After` (capped at 30s) and retry once
 
 ### Result Processing
 
@@ -319,7 +325,6 @@ Issues and pull requests are welcome! Some areas for potential improvement:
 
 - Enhanced content parsing options
 - Caching layer for frequently accessed content
-- Additional rate limiting strategies
 
 ## License
 

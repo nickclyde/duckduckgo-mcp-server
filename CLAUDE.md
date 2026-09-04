@@ -46,7 +46,7 @@ Single-module server in `src/duckduckgo_mcp_server/server.py` with three main cl
 
 - **`DuckDuckGoSearcher`** — Scrapes DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html`) via POST requests. Parses results with BeautifulSoup. Handles SafeSearch (`kp` param) and region (`kl` param) configuration.
 - **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer), and returns cleaned text truncated to 8000 chars.
-- **`RateLimiter`** — Sliding-window rate limiter (30 req/min for search, 20 req/min for content fetching).
+- **`RateLimiter`** — Sliding-window limiter (default). `TokenBucketLimiter` is the optional burst-then-smooth strategy. `HostRateLimiter` adds a per-host fetch cap. HTTP 429 honors `Retry-After` and retries once.
 
 Two MCP tools are exposed: `search` and `fetch_content`.
 
@@ -59,6 +59,8 @@ Environment variables read at startup (not per-request):
 - `DDG_SEARCH_BACKEND`: `auto` (default) | `httpx` | `curl` — HTTP backend for the search tool. `auto` falls back to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a fingerprint block (HTTP 202/403); `curl`/fallback need the `[browser]` extra. Also settable via `--search-backend`.
 - `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
 - `DDG_CA_CERTS`: path to a PEM CA bundle for verifying TLS on outbound requests (needed behind TLS-intercepting proxies — httpx no longer reads `SSL_CERT_FILE`). `DDG_SSL_VERIFY=0` disables verification entirely (discouraged). Also `--ca-certs` / `--no-ssl-verify`. Applies to all four client sites (httpx + curl_cffi, search + fetch).
+- `DDG_RATE_LIMIT_STRATEGY`: `sliding` (default) or `token_bucket`. Also `--rate-limit-strategy`.
+- `DDG_SEARCH_RPM` / `DDG_FETCH_RPM` / `DDG_FETCH_HOST_RPM`: rate-limit caps (defaults 30 / 20 / 10). Host cap `0` disables. Also `--search-rpm` / `--fetch-rpm` / `--fetch-host-rpm`.
 
 ## Testing
 
