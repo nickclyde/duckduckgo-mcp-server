@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Model Context Protocol (MCP) server providing DuckDuckGo web search and webpage content fetching. Built with Python using the FastMCP framework. Published to PyPI as `duckduckgo-mcp-server`.
+A Model Context Protocol (MCP) server providing DuckDuckGo web search and webpage content fetching. Built with Python on the MCP Python SDK's `MCPServer` (formerly FastMCP). Published to PyPI as `duckduckgo-mcp-server`.
 
 ## Commands
 
@@ -67,13 +67,13 @@ Environment variables read at startup (not per-request):
 
 ## Testing
 
-- **Unit tests** (`test_server.py`): 78 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
-- **E2E tests** (`test_e2e.py`): 6 tests using `pytest-asyncio` with MCP SDK's `create_connected_server_and_client_session` from `mcp.shared.memory` for in-memory MCP client/server testing.
+- **Unit tests** (`test_server.py`): 118 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
+- **E2E tests** (`test_e2e.py`): 6 tests using `pytest-asyncio` with the MCP SDK's in-memory `mcp.client.Client(server)` for MCP client/server testing.
 - **CI**: GitHub Actions (`.github/workflows/test.yml`) runs a `test` job (pytest on Python 3.10–3.14) and a `quality` job (`ruff check` — blocking — plus a non-blocking `pip-audit` dependency scan), all using `astral-sh/setup-uv`.
 
 ## Key Dependencies
 
-- `mcp[cli]>=1.26.0` (FastMCP framework)
+- `mcp[cli]>=2.1.1,<3` (`MCPServer` API; v1's `mcp.server.fastmcp` no longer exists)
 - `httpx>=0.28.1` + `httpcore>=1.0.8` (async HTTP client; httpcore 1.0.8+ required for Python 3.14)
 - `beautifulsoup4` (HTML parsing)
 - Dev: `pytest`, `pytest-asyncio`, `anyio`

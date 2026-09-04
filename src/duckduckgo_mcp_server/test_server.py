@@ -1246,11 +1246,6 @@ class TestSSRFGuard(unittest.TestCase):
 
 
 def _setup_mock_mcp_for_http(mock_mcp):
-    mock_mcp.settings.host = "127.0.0.1"
-    mock_mcp.settings.port = 8000
-    mock_mcp.settings.sse_path = "/sse"
-    mock_mcp.settings.streamable_http_path = "/mcp"
-
     sse_app = MagicMock()
     sse_app.router.lifespan_context = MagicMock(name="sse_lifespan")
     http_app = MagicMock()
@@ -1313,7 +1308,7 @@ class TestMainCliArgs(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         duckduckgo_mcp_server.server.main()
 
-    def test_main_applies_host_and_port_to_settings(self):
+    def test_main_applies_host_and_port_to_apps(self):
         argv = [
             "duckduckgo-mcp-server",
             "--transport", "streamable-http",
@@ -1325,8 +1320,10 @@ class TestMainCliArgs(unittest.TestCase):
              patch("uvicorn.run") as mock_uvicorn_run:
             _setup_mock_mcp_for_http(mock_mcp)
             duckduckgo_mcp_server.server.main()
-            self.assertEqual(mock_mcp.settings.host, "0.0.0.0")
-            self.assertEqual(mock_mcp.settings.port, 7070)
+            # The bind host reaches both app factories (it decides whether the
+            # SDK auto-enables DNS-rebinding protection); the port goes to uvicorn.
+            self.assertEqual(mock_mcp.sse_app.call_args.kwargs["host"], "0.0.0.0")
+            self.assertEqual(mock_mcp.streamable_http_app.call_args.kwargs["host"], "0.0.0.0")
             mock_uvicorn_run.assert_called_once()
             call_kwargs = mock_uvicorn_run.call_args.kwargs
             self.assertEqual(call_kwargs["host"], "0.0.0.0")
@@ -1418,8 +1415,9 @@ class TestMainCliArgs(unittest.TestCase):
              patch("uvicorn.run") as mock_uvicorn_run:
             _setup_mock_mcp_for_http(mock_mcp)
             duckduckgo_mcp_server.server.main()
-            self.assertEqual(mock_mcp.settings.host, "127.0.0.1")
-            self.assertEqual(mock_mcp.settings.port, 8000)
+            self.assertEqual(mock_mcp.streamable_http_app.call_args.kwargs["host"], "127.0.0.1")
+            self.assertEqual(mock_mcp.streamable_http_app.call_args.kwargs["streamable_http_path"], "/mcp")
+            self.assertEqual(mock_mcp.sse_app.call_args.kwargs["sse_path"], "/sse")
             call_kwargs = mock_uvicorn_run.call_args.kwargs
             self.assertEqual(call_kwargs["host"], "127.0.0.1")
             self.assertEqual(call_kwargs["port"], 8000)
@@ -1427,7 +1425,7 @@ class TestMainCliArgs(unittest.TestCase):
 
 class TestTransportSecurity(unittest.TestCase):
     def test_build_returns_none_when_unset(self):
-        # Nothing configured → keep FastMCP's secure default (None).
+        # Nothing configured → keep the SDK's secure default (None).
         self.assertIsNone(_build_transport_security([], [], False))
 
     def test_build_allowlist_keeps_protection_on(self):
@@ -1451,7 +1449,8 @@ class TestTransportSecurity(unittest.TestCase):
              patch("uvicorn.run"):
             _setup_mock_mcp_for_http(mock_mcp)
             duckduckgo_mcp_server.server.main()
-            ts = mock_mcp.settings.transport_security
+            ts = mock_mcp.streamable_http_app.call_args.kwargs["transport_security"]
+            self.assertIs(mock_mcp.sse_app.call_args.kwargs["transport_security"], ts)
             self.assertTrue(ts.enable_dns_rebinding_protection)
             self.assertEqual(ts.allowed_hosts, ["ddg.example.com", "ddg.example.com:*"])
 
@@ -1465,7 +1464,7 @@ class TestTransportSecurity(unittest.TestCase):
              patch("uvicorn.run"):
             _setup_mock_mcp_for_http(mock_mcp)
             duckduckgo_mcp_server.server.main()
-            ts = mock_mcp.settings.transport_security
+            ts = mock_mcp.sse_app.call_args.kwargs["transport_security"]
             self.assertFalse(ts.enable_dns_rebinding_protection)
 
 

@@ -1,4 +1,4 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.mcpserver import MCPServer, Context
 import httpx
 from bs4 import BeautifulSoup, NavigableString
 from typing import List, Optional
@@ -1061,8 +1061,13 @@ class WebContentFetcher:
             return f"Error: An unexpected error occurred while fetching the webpage ({str(e)})"
 
 
-# Initialize FastMCP server
-mcp = FastMCP("ddg-search")
+# Initialize the MCP server
+mcp = MCPServer("ddg-search")
+
+# Endpoint paths for the HTTP transports (the SDK defaults, made explicit so the
+# startup banner and the mounted apps cannot drift apart).
+SSE_PATH = "/sse"
+STREAMABLE_HTTP_PATH = "/mcp"
 
 def _env_flag(name: str) -> bool:
     """True when the named env var is set to a truthy string (1/true/yes/on)."""
@@ -1108,7 +1113,7 @@ def _resolve_ssl_verify(ca_certs: str, verify_enabled: bool = True):
 def _build_transport_security(allowed_hosts, allowed_origins, disable):
     """Build TransportSecuritySettings for HTTP transports, or None to keep defaults.
 
-    Returns None when nothing is configured (so FastMCP's secure localhost default is
+    Returns None when nothing is configured (so the SDK's secure localhost default is
     preserved). When an allow-list is given, DNS rebinding protection stays on but the
     supplied Host/Origin values are permitted — the fix for 421 Misdirected Request
     behind a reverse proxy / in Docker (issue #45). `disable` turns the protection off
@@ -1521,19 +1526,16 @@ def main():
     elif transports.issubset({"sse", "streamable-http"}):
         host = args.host or "127.0.0.1"
         port = args.port or 8000
-        mcp.settings.host = host
-        mcp.settings.port = port
 
-        # Configure DNS-rebinding protection. By default FastMCP only allows
+        # Configure DNS-rebinding protection. By default the SDK only allows
         # localhost Host/Origin headers, which yields 421 Misdirected Request behind
-        # a reverse proxy / in Docker (issue #45). Applying an allow-list (or an
-        # explicit disable) here overrides that before the apps are built.
+        # a reverse proxy / in Docker (issue #45). An allow-list (or an explicit
+        # disable) is passed to the app factories below; None keeps the default.
         allowed_hosts = args.allowed_hosts if args.allowed_hosts is not None else ALLOWED_HOSTS
         allowed_origins = args.allowed_origins if args.allowed_origins is not None else ALLOWED_ORIGINS
         disable_dns = args.disable_dns_rebinding_protection or DISABLE_DNS_REBINDING
         transport_security = _build_transport_security(allowed_hosts, allowed_origins, disable_dns)
         if transport_security is not None:
-            mcp.settings.transport_security = transport_security
             print(
                 f"  Transport security: dns_rebinding_protection={not disable_dns}, "
                 f"allowed_hosts={allowed_hosts or '[]'}, allowed_origins={allowed_origins or '[]'}",
@@ -1541,8 +1543,14 @@ def main():
             )
 
         # SSE and Streamable HTTP app setup
-        sse_app = mcp.sse_app()
-        http_app = mcp.streamable_http_app()
+        sse_app = mcp.sse_app(
+            host=host, sse_path=SSE_PATH, transport_security=transport_security
+        )
+        http_app = mcp.streamable_http_app(
+            host=host,
+            streamable_http_path=STREAMABLE_HTTP_PATH,
+            transport_security=transport_security,
+        )
 
         # Create combined routes with proper deduplication
         combined_routes: list[BaseRoute] = []
@@ -1600,11 +1608,11 @@ def main():
         )
         if "sse" in transports:
             print(
-                f"SSE endpoint: http://{host}:{port}{mcp.settings.sse_path}"
+                f"SSE endpoint: http://{host}:{port}{SSE_PATH}"
             )
         if "streamable-http" in transports:
             print(
-                f"Streamable HTTP endpoint: http://{host}:{port}{mcp.settings.streamable_http_path}"
+                f"Streamable HTTP endpoint: http://{host}:{port}{STREAMABLE_HTTP_PATH}"
             )
 
         uvicorn.run(app, host=host, port=port)

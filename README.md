@@ -117,7 +117,7 @@ uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 
 #### Running behind a reverse proxy or in Docker
 
-FastMCP enables DNS-rebinding protection for the HTTP transports and, by default, only accepts `Host`/`Origin` headers for `localhost`. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+The MCP SDK enables DNS-rebinding protection for the HTTP transports and, by default, only accepts `Host`/`Origin` headers for `localhost`. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
 
 Fix it by allow-listing the host(s) and origin(s) clients actually use (preferred over disabling protection). Values support `host`, `host:port`, and wildcard-port `host:*`:
 

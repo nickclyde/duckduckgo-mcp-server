@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client import Client
 
 import duckduckgo_mcp_server.server as ddg_server
 from duckduckgo_mcp_server.server import mcp as mcp_app
@@ -76,7 +76,7 @@ def local_http_server():
 
 @pytest.mark.asyncio
 async def test_server_lists_tools():
-    async with create_connected_server_and_client_session(mcp_app) as client:
+    async with Client(mcp_app) as client:
         tools_result = await client.list_tools()
         tool_names = {t.name for t in tools_result.tools}
         assert "search" in tool_names
@@ -84,8 +84,8 @@ async def test_server_lists_tools():
 
         # Verify input schemas exist
         for tool in tools_result.tools:
-            assert tool.inputSchema is not None
-            assert "properties" in tool.inputSchema
+            assert tool.input_schema is not None
+            assert "properties" in tool.input_schema
 
 
 @pytest.mark.asyncio
@@ -93,7 +93,7 @@ async def test_fetch_content_tool_e2e(local_http_server, allow_private_fetches):
     html = "<html><body><h1>Hello E2E</h1><p>Test content here.</p></body></html>"
     url = local_http_server(html)
 
-    async with create_connected_server_and_client_session(mcp_app) as client:
+    async with Client(mcp_app) as client:
         result = await client.call_tool("fetch_content", {"url": url})
         text = result.content[0].text
         assert "Hello E2E" in text
@@ -117,7 +117,7 @@ async def test_search_tool_e2e(ddg_html_factory):
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        async with create_connected_server_and_client_session(mcp_app) as client:
+        async with Client(mcp_app) as client:
             result = await client.call_tool("search", {"query": "e2e test"})
             text = result.content[0].text
             assert "E2E Result" in text
@@ -130,7 +130,7 @@ async def test_fetch_content_tool_accepts_backend_param(local_http_server, allow
     html = "<html><body><h1>Backend Param Test</h1></body></html>"
     url = local_http_server(html)
 
-    async with create_connected_server_and_client_session(mcp_app) as client:
+    async with Client(mcp_app) as client:
         result = await client.call_tool("fetch_content", {"url": url, "backend": "httpx"})
         text = result.content[0].text
         assert "Backend Param Test" in text
@@ -138,13 +138,13 @@ async def test_fetch_content_tool_accepts_backend_param(local_http_server, allow
 
 @pytest.mark.asyncio
 async def test_fetch_content_tool_lists_backend_in_schema():
-    """The `backend` parameter should be advertised in fetch_content's inputSchema."""
-    async with create_connected_server_and_client_session(mcp_app) as client:
+    """The `backend` parameter should be advertised in fetch_content's input schema."""
+    async with Client(mcp_app) as client:
         tools_result = await client.list_tools()
         fetch_tool = next(t for t in tools_result.tools if t.name == "fetch_content")
-        props = fetch_tool.inputSchema.get("properties", {})
-        assert "backend" in props, f"expected 'backend' in fetch_content inputSchema, got: {list(props)}"
-        assert "parse_mode" in props, f"expected 'parse_mode' in fetch_content inputSchema, got: {list(props)}"
+        props = fetch_tool.input_schema.get("properties", {})
+        assert "backend" in props, f"expected 'backend' in fetch_content input schema, got: {list(props)}"
+        assert "parse_mode" in props, f"expected 'parse_mode' in fetch_content input schema, got: {list(props)}"
 
 
 @pytest.mark.asyncio
@@ -155,7 +155,7 @@ async def test_search_tool_handles_errors():
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        async with create_connected_server_and_client_session(mcp_app) as client:
+        async with Client(mcp_app) as client:
             result = await client.call_tool("search", {"query": "timeout test"})
             text = result.content[0].text
             # Should return a user-friendly message, not a protocol error
