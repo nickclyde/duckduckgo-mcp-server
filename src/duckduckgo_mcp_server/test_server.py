@@ -146,7 +146,11 @@ class TestTTLCache(unittest.TestCase):
 
     def test_content_cache_key_includes_backend(self):
         key = _content_cache_key("https://Example.com/a#x", "httpx")
-        self.assertEqual(key, ("https://example.com/a", "httpx"))
+        self.assertEqual(key, ("https://example.com/a", "httpx", "text"))
+        self.assertEqual(
+            _content_cache_key("https://Example.com/a#x", "httpx", "markdown"),
+            ("https://example.com/a", "httpx", "markdown"),
+        )
 
     def test_html_to_text_strips_chrome(self):
         html = (
