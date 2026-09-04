@@ -32,6 +32,7 @@ from duckduckgo_mcp_server.server import (
     _html_to_text,
     _env_nonneg_int,
     SUPPORTED_PARSE_MODES,
+    _safe_markdown_href,
 )
 
 try:
@@ -716,6 +717,26 @@ class TestParseModes(unittest.TestCase):
         self.assertIn("code_sample()", md)
         self.assertNotIn("Site Nav", md)
         self.assertNotIn("Related junk", md)
+
+    def test_markdown_href_allows_only_http_https(self):
+        self.assertEqual(_safe_markdown_href("https://ex.com/a"), "https://ex.com/a")
+        self.assertEqual(_safe_markdown_href("http://ex.com/a"), "http://ex.com/a")
+        self.assertIsNone(_safe_markdown_href("javascript:alert(1)"))
+        self.assertIsNone(_safe_markdown_href("data:text/html,x"))
+        self.assertIsNone(_safe_markdown_href("/relative"))
+        self.assertIsNone(_safe_markdown_href("https://ex.com/a\n) extra"))
+
+    def test_markdown_mode_drops_javascript_links(self):
+        html = (
+            "<html><body><article><p>See "
+            '<a href="javascript:alert(1)">bad</a> and '
+            '<a href="https://ok.example/x">good</a>.'
+            "</p></article></body></html>"
+        )
+        md = _html_to_text(html, "markdown")
+        self.assertNotIn("javascript:", md)
+        self.assertIn("[good](https://ok.example/x)", md)
+        self.assertIn("bad", md)
 
     def test_unknown_mode_raises(self):
         with self.assertRaises(ValueError):

@@ -550,6 +550,23 @@ def _select_main_root(soup: BeautifulSoup):
     return best or soup
 
 
+def _safe_markdown_href(href: str) -> Optional[str]:
+    """Allow only http(s) targets with no markdown breakout characters."""
+    cleaned = "".join(ch for ch in (href or "").strip() if ch >= " " and ch not in "\r\n")
+    if not cleaned:
+        return None
+    if any(ch.isspace() for ch in cleaned):
+        return None
+    parsed = urllib.parse.urlsplit(cleaned)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return None
+    return cleaned.replace(")", "%29")
+
+
+def _safe_markdown_label(label: str) -> str:
+    return re.sub(r"[\r\n\[\]]", "", label or "").strip()
+
+
 def _inline_markdown(el) -> str:
     """Render an element and its descendants as inline markdown."""
     if isinstance(el, NavigableString):
@@ -558,8 +575,8 @@ def _inline_markdown(el) -> str:
     if name == "br":
         return "\n"
     if name == "a":
-        href = (el.get("href") or "").strip()
-        label = el.get_text(" ", strip=True)
+        href = _safe_markdown_href(el.get("href") or "")
+        label = _safe_markdown_label(el.get_text(" ", strip=True))
         if href and label:
             return f"[{label}]({href})"
         return label
