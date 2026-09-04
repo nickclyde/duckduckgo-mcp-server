@@ -122,9 +122,9 @@ def _normalize_cache_url(url: str) -> str:
     return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
-def _content_cache_key(url: str, backend: str, parse_mode: str = "text") -> tuple:
-    """Cache key for a fetched page. ``parse_mode`` is reserved for extractors."""
-    return (_normalize_cache_url(url), backend, parse_mode)
+def _content_cache_key(url: str, backend: str) -> tuple:
+    """Cache key for a fetched page: canonical URL plus fetch backend."""
+    return (_normalize_cache_url(url), backend)
 
 
 # Backends shared by both search and fetch_content. "auto" tries httpx first and

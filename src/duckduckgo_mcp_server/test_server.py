@@ -143,9 +143,9 @@ class TestTTLCache(unittest.TestCase):
             "http://example.com:8080/x?q=1",
         )
 
-    def test_content_cache_key_includes_backend_and_parse_mode(self):
+    def test_content_cache_key_includes_backend(self):
         key = _content_cache_key("https://Example.com/a#x", "httpx")
-        self.assertEqual(key, ("https://example.com/a", "httpx", "text"))
+        self.assertEqual(key, ("https://example.com/a", "httpx"))
 
     def test_html_to_text_strips_chrome(self):
         html = (
