@@ -61,6 +61,7 @@ Environment variables read at startup (not per-request):
 - `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
 - `DDG_CA_CERTS`: path to a PEM CA bundle for verifying TLS on outbound requests (needed behind TLS-intercepting proxies — httpx no longer reads `SSL_CERT_FILE`). `DDG_SSL_VERIFY=0` disables verification entirely (discouraged). Also `--ca-certs` / `--no-ssl-verify`. Applies to all four client sites (httpx + curl_cffi, search + fetch).
 - `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES`: in-memory `fetch_content` cache (default 300s / 64 entries). `0` disables. Also `--cache-ttl` / `--cache-max-entries`.
+- `DDG_PARSE_MODE`: default `fetch_content` extractor (`text` / `main` / `markdown`). Also `--parse-mode`. Per-call `parse_mode` overrides it. Cache keys include the mode.
 
 ## Testing
 

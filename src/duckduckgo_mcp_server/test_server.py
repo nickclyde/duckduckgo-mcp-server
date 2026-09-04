@@ -31,6 +31,7 @@ from duckduckgo_mcp_server.server import (
     _content_cache_key,
     _html_to_text,
     _env_nonneg_int,
+    SUPPORTED_PARSE_MODES,
 )
 
 try:
@@ -659,6 +660,104 @@ class TestWebContentFetcherCache(unittest.TestCase):
             asyncio.run(fetcher.fetch_and_parse("https://example.com/a#two", DummyCtx()))
 
         self.assertEqual(fetch_count["n"], 1)
+
+
+_ARTICLE_HTML = """
+<html>
+  <body>
+    <nav>Site Nav</nav>
+    <aside>Related junk</aside>
+    <article>
+      <h1>Primary Title</h1>
+      <p>The real article paragraph with <a href="https://ex.com/more">a link</a>.</p>
+      <ul>
+        <li>First item</li>
+        <li>Second item</li>
+      </ul>
+      <pre>code_sample()</pre>
+    </article>
+    <footer>Copyright</footer>
+  </body>
+</html>
+"""
+
+
+class TestParseModes(unittest.TestCase):
+    def test_supported_modes(self):
+        self.assertEqual(SUPPORTED_PARSE_MODES, ("text", "main", "markdown"))
+
+    def test_text_mode_includes_non_chrome_siblings(self):
+        # aside is now treated as chrome and stripped; leftover non-article
+        # text still appears in text mode when it is not chrome.
+        html = "<html><body><article><p>Inside</p></article><section>Outside section</section></body></html>"
+        text = _html_to_text(html, "text")
+        self.assertIn("Inside", text)
+        self.assertIn("Outside section", text)
+
+    def test_main_mode_drops_sidebar_and_keeps_article(self):
+        text = _html_to_text(_ARTICLE_HTML, "main")
+        self.assertIn("Primary Title", text)
+        self.assertIn("real article paragraph", text)
+        self.assertNotIn("Site Nav", text)
+        self.assertNotIn("Related junk", text)
+        self.assertNotIn("Copyright", text)
+
+    def test_markdown_mode_preserves_structure(self):
+        md = _html_to_text(_ARTICLE_HTML, "markdown")
+        self.assertIn("# Primary Title", md)
+        self.assertIn("[a link](https://ex.com/more)", md)
+        self.assertIn("- First item", md)
+        self.assertIn("- Second item", md)
+        self.assertIn("```", md)
+        self.assertIn("code_sample()", md)
+        self.assertNotIn("Site Nav", md)
+        self.assertNotIn("Related junk", md)
+
+    def test_unknown_mode_raises(self):
+        with self.assertRaises(ValueError):
+            _html_to_text("<p>x</p>", "bogus")
+
+    def test_init_rejects_unknown_parse_mode(self):
+        with self.assertRaises(ValueError):
+            WebContentFetcher(parse_mode="bogus")
+
+    def test_per_call_unknown_parse_mode_returns_error(self):
+        fetcher = WebContentFetcher()
+        result = asyncio.run(
+            fetcher.fetch_and_parse("https://example.com", DummyCtx(), parse_mode="bogus")
+        )
+        self.assertIn("Unknown parse_mode", result)
+
+    def test_parse_modes_use_separate_cache_entries(self):
+        fetcher = WebContentFetcher(backend="httpx", allow_private_urls=True)
+        fetch_count = {"n": 0}
+
+        async def fake_httpx(url):
+            fetch_count["n"] += 1
+            return _ARTICLE_HTML
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            text = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/a", DummyCtx(), parse_mode="text")
+            )
+            main = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/a", DummyCtx(), parse_mode="main")
+            )
+            again = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/a", DummyCtx(), parse_mode="text")
+            )
+
+        self.assertEqual(fetch_count["n"], 2)
+        self.assertIn("parse=text", text)
+        self.assertIn("parse=main", main)
+        self.assertIn("cache=hit", again)
+
+    def test_main_parses_parse_mode_flag(self):
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--parse-mode", "markdown"]), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+            duckduckgo_mcp_server.server.main()
+            mock_mcp.run.assert_called_once()
+        self.assertEqual(duckduckgo_mcp_server.server.fetcher.default_parse_mode, "markdown")
 
 
 def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=None):

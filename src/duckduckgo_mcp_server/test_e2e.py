@@ -144,6 +144,7 @@ async def test_fetch_content_tool_lists_backend_in_schema():
         fetch_tool = next(t for t in tools_result.tools if t.name == "fetch_content")
         props = fetch_tool.inputSchema.get("properties", {})
         assert "backend" in props, f"expected 'backend' in fetch_content inputSchema, got: {list(props)}"
+        assert "parse_mode" in props, f"expected 'parse_mode' in fetch_content inputSchema, got: {list(props)}"
 
 
 @pytest.mark.asyncio
