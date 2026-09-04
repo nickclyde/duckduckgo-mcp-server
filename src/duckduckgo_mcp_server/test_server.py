@@ -32,6 +32,9 @@ from duckduckgo_mcp_server.server import (
     _resolve_ssl_verify,
     _retry_after_seconds,
     make_rate_limiter,
+    LinkRegistry,
+    is_ref_token,
+    DEFAULT_REF_URL_THRESHOLD,
     _normalize_cache_url,
     _content_cache_key,
     _html_to_text,
@@ -310,6 +313,120 @@ class TestTTLCache(unittest.TestCase):
             self.assertEqual(_env_int("DDG_CACHE_TTL", 300), 300)
         with patch.dict(os.environ, {"DDG_CACHE_TTL": "12"}, clear=False):
             self.assertEqual(_env_int("DDG_CACHE_TTL", 300), 12)
+
+
+_LONG_URL = "https://example.com/articles/2026/09/04/" + "a-very-long-slug-" * 8 + "?utm_source=x&utm_medium=y"
+
+
+class TestLinkRegistry(unittest.TestCase):
+    def test_shorten_is_stable_and_round_trips(self):
+        reg = LinkRegistry()
+        token = reg.shorten(_LONG_URL)
+        self.assertTrue(token.startswith("ref://"))
+        self.assertEqual(len(token), len("ref://") + 8)
+        self.assertEqual(reg.shorten(_LONG_URL), token)
+        self.assertEqual(len(reg), 1)
+        self.assertEqual(reg.resolve(token), _LONG_URL)
+        # Bare id, mixed case, and a trailing slash all resolve.
+        bare = token[len("ref://"):]
+        self.assertEqual(reg.resolve(bare), _LONG_URL)
+        self.assertEqual(reg.resolve("REF://" + bare.upper() + "/"), _LONG_URL)
+
+    def test_resolve_unknown_returns_none(self):
+        reg = LinkRegistry()
+        self.assertIsNone(reg.resolve("ref://deadbeef"))
+        self.assertIsNone(reg.resolve(""))
+        self.assertIsNone(reg.resolve("https://example.com"))
+
+    def test_collision_extends_id(self):
+        reg = LinkRegistry()
+        token = reg.shorten(_LONG_URL)
+        key = token[len("ref://"):]
+        # Simulate another URL already owning the 8-char prefix.
+        reg._urls.clear()
+        reg._urls[key] = "https://other.example/"
+        longer = reg.shorten(_LONG_URL)
+        self.assertNotEqual(longer, token)
+        self.assertTrue(longer[len("ref://"):].startswith(key))
+        self.assertEqual(reg.resolve(longer), _LONG_URL)
+        self.assertEqual(reg.resolve(token), "https://other.example/")
+
+    def test_lru_eviction(self):
+        reg = LinkRegistry(max_entries=2)
+        t1 = reg.shorten("https://one.example/" + "x" * 50)
+        t2 = reg.shorten("https://two.example/" + "x" * 50)
+        reg.resolve(t1)  # t1 becomes most recently used
+        reg.shorten("https://three.example/" + "x" * 50)
+        self.assertIsNotNone(reg.resolve(t1))
+        self.assertIsNone(reg.resolve(t2))
+        self.assertEqual(len(reg), 2)
+
+    def test_is_ref_token(self):
+        self.assertTrue(is_ref_token("ref://abc"))
+        self.assertTrue(is_ref_token("  REF://abc"))
+        self.assertFalse(is_ref_token("https://example.com"))
+        self.assertFalse(is_ref_token(""))
+
+
+class TestRefLinksInToolOutput(unittest.TestCase):
+    def test_format_results_shortens_only_long_urls(self):
+        reg = LinkRegistry()
+        searcher = DuckDuckGoSearcher(ref_url_threshold=60, link_registry=reg)
+        results = [
+            SearchResult(title="Short", link="https://example.com/a", snippet="s", position=1),
+            SearchResult(title="Long", link=_LONG_URL, snippet="l", position=2),
+        ]
+        out = searcher.format_results_for_llm(results)
+        self.assertIn("URL: https://example.com/a", out)
+        self.assertNotIn(_LONG_URL, out)
+        self.assertIn("URL: ref://", out)
+        self.assertIn("expand_link", out)
+        token = next(w for w in out.split() if w.startswith("ref://"))
+        self.assertEqual(reg.resolve(token), _LONG_URL)
+
+    def test_default_threshold_and_disable(self):
+        self.assertEqual(DuckDuckGoSearcher().ref_url_threshold, DEFAULT_REF_URL_THRESHOLD)
+        reg = LinkRegistry()
+        searcher = DuckDuckGoSearcher(ref_url_threshold=0, link_registry=reg)
+        out = searcher.format_results_for_llm(
+            [SearchResult(title="Long", link=_LONG_URL, snippet="l", position=1)]
+        )
+        self.assertIn(_LONG_URL, out)
+        self.assertEqual(len(reg), 0)
+
+    def test_fetch_and_parse_resolves_ref_token(self):
+        reg = LinkRegistry()
+        token = reg.shorten(_LONG_URL)
+        fetcher = WebContentFetcher(backend="httpx", link_registry=reg)
+        seen = {}
+
+        async def fake_httpx(url):
+            seen["url"] = url
+            return "<html><body><p>Resolved page</p></body></html>"
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            result = asyncio.run(fetcher.fetch_and_parse(token, DummyCtx()))
+
+        self.assertEqual(seen["url"], _LONG_URL)
+        self.assertIn("Resolved page", result)
+
+    def test_fetch_and_parse_unknown_ref_token_does_not_fetch(self):
+        fetcher = WebContentFetcher(backend="httpx", link_registry=LinkRegistry())
+        with patch.object(fetcher, "_fetch_httpx", new_callable=AsyncMock) as mock_fetch:
+            result = asyncio.run(fetcher.fetch_and_parse("ref://deadbeef", DummyCtx()))
+        mock_fetch.assert_not_called()
+        self.assertTrue(result.startswith("Error: Unknown link reference 'ref://deadbeef'"))
+
+    def test_main_parses_ref_url_threshold_flag(self):
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--ref-url-threshold", "0"]), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+            duckduckgo_mcp_server.server.main()
+            mock_mcp.run.assert_called_once()
+        self.assertEqual(duckduckgo_mcp_server.server.searcher.ref_url_threshold, 0)
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--ref-url-threshold", "-1"]), \
+             patch("duckduckgo_mcp_server.server.mcp"):
+            with self.assertRaises(SystemExit):
+                duckduckgo_mcp_server.server.main()
 
 
 class TestDuckDuckGoSearcher(unittest.TestCase):

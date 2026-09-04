@@ -42,14 +42,15 @@ uv run --with pip-audit pip-audit --desc
 
 ## Architecture
 
-Single-module server in `src/duckduckgo_mcp_server/server.py` with three main classes:
+Single-module server in `src/duckduckgo_mcp_server/server.py` with these main classes:
 
 - **`DuckDuckGoSearcher`** — Scrapes DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html`) via POST requests. Parses results with BeautifulSoup. Handles SafeSearch (`kp` param) and region (`kl` param) configuration.
 - **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer), and returns cleaned text truncated to 8000 chars. Parsed pages are kept in an in-memory `TTLCache` so pagination does not re-download.
 - **`RateLimiter`** — Sliding-window limiter (default). `TokenBucketLimiter` is the optional burst-then-smooth strategy. `HostRateLimiter` adds a per-host fetch cap. HTTP 429 honors `Retry-After` and retries once. Cache hits skip the fetch limiter.
 - **`TTLCache`** — TTL + LRU cache used by `fetch_content`. Disabled when TTL or max entries is 0.
+- **`LinkRegistry`** — In-memory LRU map behind `ref://<id>` tokens (issue #43). Search output replaces URLs longer than `DDG_REF_URL_THRESHOLD` with tokens; `fetch_content` resolves them before the SSRF guard; `expand_link` returns the original. Shared module-level instance `links`.
 
-Two MCP tools are exposed: `search` and `fetch_content`.
+Three MCP tools are exposed: `search`, `fetch_content`, and `expand_link`.
 
 ## Configuration
 
@@ -64,11 +65,12 @@ Environment variables read at startup (not per-request):
 - `DDG_SEARCH_RPM` / `DDG_FETCH_RPM` / `DDG_FETCH_HOST_RPM`: rate-limit caps (defaults 30 / 20 / 0; the per-host cap is opt-in). Also `--search-rpm` / `--fetch-rpm` / `--fetch-host-rpm`.
 - `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES`: in-memory `fetch_content` cache (default 300s / 64 entries). `0` disables. Also `--cache-ttl` / `--cache-max-entries`.
 - `DDG_PARSE_MODE`: default `fetch_content` extractor (`text` / `main` / `markdown`). Also `--parse-mode`. Per-call `parse_mode` overrides it. Cache keys include the mode.
+- `DDG_REF_URL_THRESHOLD`: result URLs longer than this are shown as `ref://` tokens (default 120, `0` disables). Also `--ref-url-threshold`.
 
 ## Testing
 
-- **Unit tests** (`test_server.py`): 118 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
-- **E2E tests** (`test_e2e.py`): 6 tests using `pytest-asyncio` with the MCP SDK's in-memory `mcp.client.Client(server)` for MCP client/server testing.
+- **Unit tests** (`test_server.py`): 128 tests using `unittest` style with `unittest.mock.patch` to mock httpx. Covers rate limiter, search parsing, content fetching errors, and configuration.
+- **E2E tests** (`test_e2e.py`): 8 tests using `pytest-asyncio` with the MCP SDK's in-memory `mcp.client.Client(server)` for MCP client/server testing.
 - **CI**: GitHub Actions (`.github/workflows/test.yml`) runs a `test` job (pytest on Python 3.10–3.14) and a `quality` job (`ruff check` — blocking — plus a non-blocking `pip-audit` dependency scan), all using `astral-sh/setup-uv`.
 
 ## Key Dependencies

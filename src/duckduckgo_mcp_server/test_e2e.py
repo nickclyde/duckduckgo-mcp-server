@@ -81,6 +81,7 @@ async def test_server_lists_tools():
         tool_names = {t.name for t in tools_result.tools}
         assert "search" in tool_names
         assert "fetch_content" in tool_names
+        assert "expand_link" in tool_names
 
         # Verify input schemas exist
         for tool in tools_result.tools:
@@ -160,3 +161,27 @@ async def test_search_tool_handles_errors():
             text = result.content[0].text
             # Should return a user-friendly message, not a protocol error
             assert "No results were found" in text or "error" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_expand_link_tool_round_trips_ref_token():
+    long_url = "https://example.com/" + "segment/" * 20 + "?q=1"
+    token = ddg_server.links.shorten(long_url)
+
+    async with Client(mcp_app) as client:
+        result = await client.call_tool("expand_link", {"token": token})
+        assert result.content[0].text == long_url
+
+        missing = await client.call_tool("expand_link", {"token": "ref://00000000"})
+        assert missing.content[0].text.startswith("Error: Unknown link reference")
+
+
+@pytest.mark.asyncio
+async def test_fetch_content_tool_accepts_ref_token(local_http_server, allow_private_fetches):
+    html = "<html><body><h1>Via Token</h1></body></html>"
+    url = local_http_server(html) + "/" + "p/" * 70
+    token = ddg_server.links.shorten(url)
+
+    async with Client(mcp_app) as client:
+        result = await client.call_tool("fetch_content", {"url": token})
+        assert "Via Token" in result.content[0].text

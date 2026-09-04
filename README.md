@@ -16,6 +16,7 @@ uvx duckduckgo-mcp-server
 
 - **Web Search**: Search DuckDuckGo with advanced rate limiting and result formatting
 - **Content Fetching**: Retrieve and parse webpage content with intelligent text extraction
+- **Long URL Shortening**: Over-long result URLs become short `ref://` tokens that `fetch_content` accepts directly, saving context
 - **Rate Limiting**: Built-in protection against rate limits for both search and content fetching
 - **Error Handling**: Comprehensive error handling and logging
 - **LLM-Friendly Output**: Results formatted specifically for large language model consumption
@@ -86,6 +87,7 @@ Add the following configuration:
 - `DDG_CACHE_TTL`: Seconds to keep a parsed page in the in-memory `fetch_content` cache (default: `300`). Paginated reads of the same URL reuse one download. Set `0` to disable.
 - `DDG_CACHE_MAX_ENTRIES`: Maximum pages kept in that cache (default: `64`). Least-recently-used eviction. Set `0` to disable.
 - `DDG_PARSE_MODE`: Default `fetch_content` extractor (`text`, `main`, or `markdown`). Default is `text` (historical flattened page). Per-call `parse_mode` overrides this.
+- `DDG_REF_URL_THRESHOLD`: Search-result URLs longer than this many characters are replaced with short `ref://<id>` tokens (default: `120`). Set `0` to always show full URLs. Also `--ref-url-threshold`.
 
 3. Restart Claude Desktop
 
@@ -272,7 +274,7 @@ async def fetch_content(
 Fetches and parses content from a webpage.
 
 **Parameters:**
-- `url`: The webpage URL to fetch content from
+- `url`: The webpage URL to fetch content from, or a `ref://<id>` token from search results
 - `start_index`: Character offset to start reading from (for pagination)
 - `max_length`: Maximum number of characters to return
 - `backend`: Optional per-call override of the default fetch backend (`"httpx"`, `"curl"`, or `"auto"`). When omitted, uses whatever was set via `--fetch-backend` at server startup.
@@ -288,6 +290,20 @@ Cleaned and formatted text content from the webpage. The parsed full page is cac
 > trusted local deployments that need to fetch internal hosts, disable the guard
 > with `DDG_ALLOW_PRIVATE_URLS=1` or `--allow-private-urls`. See
 > [SECURITY.md](SECURITY.md) for details.
+
+### 3. Link Expansion Tool
+
+```python
+async def expand_link(token: str) -> str
+```
+
+Search results replace URLs longer than `DDG_REF_URL_THRESHOLD` characters (default 120) with short, stable `ref://<id>` tokens so long tracking-laden links do not eat context. `fetch_content` accepts a token in place of a URL, so the model only needs this tool when it has to show or cite the real link.
+
+**Parameters:**
+- `token`: A `ref://<id>` token exactly as it appeared in search results (the bare id also works)
+
+**Returns:**
+The full original URL, or an error if the token is unknown. Tokens live in memory for the lifetime of the server process (bounded by an LRU cap), so they are forgotten on restart.
 
 ## Features in Detail
 
