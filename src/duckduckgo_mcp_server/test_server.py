@@ -17,20 +17,25 @@ from duckduckgo_mcp_server.server import _build_transport_security
 
 from duckduckgo_mcp_server.server import (
     RateLimiter,
+    TokenBucketLimiter,
+    HostRateLimiter,
     TTLCache,
     DuckDuckGoSearcher,
     SafeSearchMode,
     SearchResult,
     SUPPORTED_FETCH_BACKENDS,
+    SUPPORTED_RATE_STRATEGIES,
     WebContentFetcher,
     BlockedURLError,
     _validate_public_url,
     _is_search_block,
     _resolve_ssl_verify,
+    _retry_after_seconds,
+    make_rate_limiter,
     _normalize_cache_url,
     _content_cache_key,
     _html_to_text,
-    _env_nonneg_int,
+    _env_int,
     SUPPORTED_PARSE_MODES,
     _safe_markdown_href,
 )
@@ -67,13 +72,20 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
         now = datetime.now()
         limiter.requests = [now - timedelta(seconds=10), now - timedelta(seconds=5)]
 
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        async def fake_sleep(seconds):
+            # Advance the window the same way a real wait would.
+            limiter.requests = [
+                t - timedelta(seconds=seconds + 0.1) for t in limiter.requests
+            ]
+
+        with patch("asyncio.sleep", side_effect=fake_sleep) as mock_sleep:
             asyncio.run(limiter.acquire())
-            mock_sleep.assert_called_once()
-            # Should wait roughly 50 seconds (60 - 10)
-            wait_time = mock_sleep.call_args[0][0]
+            mock_sleep.assert_called()
+            wait_time = mock_sleep.call_args_list[0][0][0]
             self.assertGreater(wait_time, 40)
             self.assertLessEqual(wait_time, 60)
+            # Recorded after the wait, so we stay at the cap instead of rpm+1.
+            self.assertEqual(len(limiter.requests), 2)
 
     def test_acquire_allows_after_window_expires(self):
         limiter = RateLimiter(requests_per_minute=2)
@@ -85,6 +97,132 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             asyncio.run(limiter.acquire())
             mock_sleep.assert_not_called()
+
+
+class TestTokenBucketAndHostLimits(unittest.TestCase):
+    def test_make_rate_limiter_strategies(self):
+        self.assertEqual(SUPPORTED_RATE_STRATEGIES, ("sliding", "token_bucket"))
+        self.assertIsInstance(make_rate_limiter("sliding", 10), RateLimiter)
+        self.assertIsInstance(make_rate_limiter("token_bucket", 10), TokenBucketLimiter)
+        with self.assertRaises(ValueError):
+            make_rate_limiter("bogus", 10)
+
+    def test_token_bucket_allows_burst_without_sleep(self):
+        limiter = TokenBucketLimiter(requests_per_minute=30, burst=2)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(limiter.acquire())
+            asyncio.run(limiter.acquire())
+            mock_sleep.assert_not_called()
+
+    def test_token_bucket_sleeps_when_empty(self):
+        limiter = TokenBucketLimiter(requests_per_minute=30, burst=1)
+        asyncio.run(limiter.acquire())
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(limiter.acquire())
+            mock_sleep.assert_called_once()
+            self.assertGreater(mock_sleep.call_args[0][0], 0)
+
+    def test_host_limiter_isolates_hosts(self):
+        limiter = HostRateLimiter("sliding", requests_per_minute=1)
+
+        async def fake_sleep(seconds):
+            # Age past the 60s window so wait-then-record can take a slot.
+            extra = max(seconds, 0) + 0.1
+            for child in limiter._limiters.values():
+                if hasattr(child, "requests"):
+                    child.requests = [t - timedelta(seconds=extra) for t in child.requests]
+
+        with patch("asyncio.sleep", side_effect=fake_sleep) as mock_sleep:
+            asyncio.run(limiter.acquire("https://a.example/1"))
+            asyncio.run(limiter.acquire("https://b.example/1"))
+            mock_sleep.assert_not_called()
+            asyncio.run(limiter.acquire("https://a.example/2"))
+            mock_sleep.assert_called()
+
+    def test_host_limiter_evicts_idle_hosts(self):
+        limiter = HostRateLimiter("sliding", requests_per_minute=5)
+        asyncio.run(limiter.acquire("https://a.example/1"))
+        asyncio.run(limiter.acquire("https://b.example/1"))
+        self.assertEqual(set(limiter._limiters), {"a.example", "b.example"})
+        # Age a.example's only request out of the window; the next acquire prunes it.
+        limiter._limiters["a.example"].requests = [datetime.now() - timedelta(seconds=61)]
+        asyncio.run(limiter.acquire("https://c.example/1"))
+        self.assertNotIn("a.example", limiter._limiters)
+        self.assertIn("b.example", limiter._limiters)
+        self.assertIn("c.example", limiter._limiters)
+
+    def test_token_bucket_idle_after_refill(self):
+        limiter = TokenBucketLimiter(requests_per_minute=60, burst=1)
+        asyncio.run(limiter.acquire())
+        self.assertFalse(limiter.idle())
+        limiter.updated -= 5  # pretend 5s passed: refills the single-token bucket
+        self.assertTrue(limiter.idle())
+
+    def test_fetcher_host_limiter_off_by_default(self):
+        self.assertIsNone(WebContentFetcher().host_limiter)
+        self.assertIsNotNone(WebContentFetcher(host_requests_per_minute=5).host_limiter)
+
+    def test_retry_after_seconds(self):
+        self.assertEqual(_retry_after_seconds({"retry-after": "5"}), 5.0)
+        self.assertIsNone(_retry_after_seconds({"retry-after": "Fri, 01 Jan 2030"}))
+        self.assertIsNone(_retry_after_seconds({}))
+
+    def test_search_retries_once_on_429(self):
+        searcher = DuckDuckGoSearcher(backend="httpx")
+        html = "<html><body></body></html>"
+        blocked = MagicMock(spec=httpx.Response)
+        blocked.status_code = 429
+        blocked.headers = {"retry-after": "1"}
+        blocked.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("429", request=MagicMock(), response=blocked)
+        )
+        ok = MagicMock(spec=httpx.Response)
+        ok.status_code = 200
+        ok.text = html
+        ok.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[blocked, ok])
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            status, body = asyncio.run(searcher._request_httpx({"q": "x"}))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, html)
+        self.assertEqual(mock_client.post.call_count, 2)
+        mock_sleep.assert_called_once()
+
+    def test_main_parses_rate_limit_flags(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "duckduckgo-mcp-server",
+                "--rate-limit-strategy",
+                "token_bucket",
+                "--search-rpm",
+                "12",
+                "--fetch-rpm",
+                "8",
+                "--fetch-host-rpm",
+                "0",
+            ],
+        ), patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+            duckduckgo_mcp_server.server.main()
+            mock_mcp.run.assert_called_once()
+        self.assertIsInstance(
+            duckduckgo_mcp_server.server.searcher.rate_limiter, TokenBucketLimiter
+        )
+        self.assertEqual(
+            duckduckgo_mcp_server.server.searcher.rate_limiter.requests_per_minute, 12
+        )
+        self.assertEqual(
+            duckduckgo_mcp_server.server.fetcher.rate_limiter.requests_per_minute, 8
+        )
+        self.assertIsNone(duckduckgo_mcp_server.server.fetcher.host_limiter)
 
 
 class TestTTLCache(unittest.TestCase):
@@ -165,13 +303,13 @@ class TestTTLCache(unittest.TestCase):
         self.assertNotIn("alert", text)
         self.assertNotIn("Foot", text)
 
-    def test_env_nonneg_int_defaults_on_bad_input(self):
+    def test_env_int_defaults_on_bad_input(self):
         with patch.dict(os.environ, {"DDG_CACHE_TTL": "nope"}, clear=False):
-            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 300)
+            self.assertEqual(_env_int("DDG_CACHE_TTL", 300), 300)
         with patch.dict(os.environ, {"DDG_CACHE_TTL": "-5"}, clear=False):
-            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 300)
+            self.assertEqual(_env_int("DDG_CACHE_TTL", 300), 300)
         with patch.dict(os.environ, {"DDG_CACHE_TTL": "12"}, clear=False):
-            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 12)
+            self.assertEqual(_env_int("DDG_CACHE_TTL", 300), 12)
 
 
 class TestDuckDuckGoSearcher(unittest.TestCase):
@@ -738,6 +876,17 @@ class TestParseModes(unittest.TestCase):
         self.assertIn("[good](https://ok.example/x)", md)
         self.assertIn("bad", md)
 
+    def test_main_mode_falls_back_to_body_without_container(self):
+        html = (
+            "<html><head><title>T</title></head><body><nav>Menu</nav>"
+            "<div><p>Left column</p></div><div><p>Right column</p></div>"
+            "</body></html>"
+        )
+        text = _html_to_text(html, "main")
+        self.assertIn("Left column", text)
+        self.assertIn("Right column", text)
+        self.assertNotIn("Menu", text)
+
     def test_unknown_mode_raises(self):
         with self.assertRaises(ValueError):
             _html_to_text("<p>x</p>", "bogus")
@@ -773,7 +922,8 @@ class TestParseModes(unittest.TestCase):
             )
 
         self.assertEqual(fetch_count["n"], 2)
-        self.assertIn("parse=text", text)
+        # The historical trailer is unchanged in the default mode.
+        self.assertNotIn("parse=", text)
         self.assertIn("parse=main", main)
         self.assertIn("cache=hit", again)
 

@@ -79,6 +79,10 @@ Add the following configuration:
   - `wt-wt`: No specific region
   - Leave empty for DuckDuckGo's default behavior
 - `DDG_CA_CERTS`: Path to a PEM CA bundle used to verify TLS certificates on outbound requests (optional). Needed behind TLS-intercepting proxies — see [Running behind a TLS-intercepting proxy](#running-behind-a-tls-intercepting-proxy).
+- `DDG_RATE_LIMIT_STRATEGY`: `sliding` (default, historical 60s window) or `token_bucket` (burst, then smooth).
+- `DDG_SEARCH_RPM`: Search requests per minute (default: `30`).
+- `DDG_FETCH_RPM`: Global `fetch_content` requests per minute (default: `20`).
+- `DDG_FETCH_HOST_RPM`: Optional per-host fetch cap (default: `0`, off). Set a positive number to enable.
 - `DDG_CACHE_TTL`: Seconds to keep a parsed page in the in-memory `fetch_content` cache (default: `300`). Paginated reads of the same URL reuse one download. Set `0` to disable.
 - `DDG_CACHE_MAX_ENTRIES`: Maximum pages kept in that cache (default: `64`). Least-recently-used eviction. Set `0` to disable.
 - `DDG_PARSE_MODE`: Default `fetch_content` extractor (`text`, `main`, or `markdown`). Default is `text` (historical flattened page). Per-call `parse_mode` overrides this.
@@ -289,9 +293,11 @@ Cleaned and formatted text content from the webpage. The parsed full page is cac
 
 ### Rate Limiting
 
-- Search: Limited to 30 requests per minute
-- Content Fetching: Limited to 20 requests per minute
-- Automatic queue management and wait times
+- Search: 30 requests per minute by default (`DDG_SEARCH_RPM` / `--search-rpm`)
+- Content fetching: 20 requests per minute globally (`DDG_FETCH_RPM` / `--fetch-rpm`)
+- Optional per-host fetch cap, off by default (`DDG_FETCH_HOST_RPM` / `--fetch-host-rpm`)
+- Strategies: `sliding` (default) or `token_bucket` via `DDG_RATE_LIMIT_STRATEGY` / `--rate-limit-strategy`
+- HTTP 429 responses honor `Retry-After` (capped at 30s) and retry once
 - Cache hits on `fetch_content` skip both the download and the fetch rate limiter
 
 ### Content cache
@@ -339,9 +345,7 @@ Cleaned and formatted text content from the webpage. The parsed full page is cac
 
 ## Contributing
 
-Issues and pull requests are welcome! Some areas for potential improvement:
-
-- Additional rate limiting strategies
+Issues and pull requests are welcome!
 
 ## License
 

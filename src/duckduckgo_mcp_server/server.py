@@ -32,25 +32,140 @@ class SearchResult:
     position: int
 
 
+SUPPORTED_RATE_STRATEGIES = ("sliding", "token_bucket")
+
+
 class RateLimiter:
+    """Sliding-window limiter (historical default): at most N requests per 60s."""
+
     def __init__(self, requests_per_minute: int = 30):
-        self.requests_per_minute = requests_per_minute
+        self.requests_per_minute = max(1, int(requests_per_minute))
         self.requests = []
+        self._lock = asyncio.Lock()
 
     async def acquire(self):
-        now = datetime.now()
-        # Remove requests older than 1 minute
-        self.requests = [
-            req for req in self.requests if now - req < timedelta(minutes=1)
-        ]
-
-        if len(self.requests) >= self.requests_per_minute:
-            # Wait until we can make another request
-            wait_time = 60 - (now - self.requests[0]).total_seconds()
+        # Wait, then record. Recording before sleep let the window grow past
+        # rpm and stamped requests at the pre-wait time (review finding).
+        while True:
+            wait_time = 0.0
+            async with self._lock:
+                now = datetime.now()
+                self.requests = [
+                    req for req in self.requests if now - req < timedelta(minutes=1)
+                ]
+                if len(self.requests) < self.requests_per_minute:
+                    self.requests.append(now)
+                    return
+                wait_time = 60 - (now - self.requests[0]).total_seconds()
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
+            else:
+                # Oldest entry is at or past the window but still listed
+                # (same-timestamp pile-up / clock resolution). Drop it so we
+                # cannot spin on sleep(0).
+                async with self._lock:
+                    if self.requests:
+                        self.requests.pop(0)
 
-        self.requests.append(now)
+    def idle(self) -> bool:
+        """True when no request falls inside the current 60s window."""
+        now = datetime.now()
+        return not any(now - req < timedelta(minutes=1) for req in self.requests)
+
+
+class TokenBucketLimiter:
+    """Token-bucket limiter: allows a short burst, then smooths to ``rpm``.
+
+    Compared with the sliding window, this spreads waits instead of blocking
+    until the oldest request ages out of a full 60s window.
+    """
+
+    def __init__(self, requests_per_minute: int = 30, burst: Optional[int] = None):
+        self.requests_per_minute = max(1, int(requests_per_minute))
+        self.rate = self.requests_per_minute / 60.0
+        self.burst = float(burst if burst is not None else self.requests_per_minute)
+        self.tokens = self.burst
+        self.updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self.updated
+        self.updated = now
+        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+
+    def idle(self) -> bool:
+        """True when the bucket has refilled to its burst capacity."""
+        self._refill()
+        return self.tokens >= self.burst
+
+    async def acquire(self):
+        wait_time = 0.0
+        async with self._lock:
+            self._refill()
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) / self.rate if self.rate > 0 else 1.0
+            self.tokens -= 1
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+
+def make_rate_limiter(strategy: str, requests_per_minute: int):
+    """Build a limiter with a common ``acquire()`` interface."""
+    if strategy == "token_bucket":
+        return TokenBucketLimiter(requests_per_minute)
+    if strategy == "sliding":
+        return RateLimiter(requests_per_minute)
+    raise ValueError(
+        f"Unknown rate-limit strategy '{strategy}'. Supported: {SUPPORTED_RATE_STRATEGIES}"
+    )
+
+
+class HostRateLimiter:
+    """Per-host limiter so fetch_content cannot spend the whole quota on one site."""
+
+    def __init__(self, strategy: str, requests_per_minute: int):
+        self.strategy = strategy
+        self.requests_per_minute = requests_per_minute
+        self._limiters: dict = {}
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, url: str) -> None:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower() or "unknown"
+        async with self._lock:
+            # Drop limiters for hosts that have gone quiet so the map does not
+            # grow by one entry per distinct host for the life of the server.
+            for stale in [h for h, lim in self._limiters.items() if h != host and lim.idle()]:
+                del self._limiters[stale]
+            limiter = self._limiters.get(host)
+            if limiter is None:
+                limiter = make_rate_limiter(self.strategy, self.requests_per_minute)
+                self._limiters[host] = limiter
+        await limiter.acquire()
+
+
+def _retry_after_seconds(headers) -> Optional[float]:
+    """Parse a Retry-After header as seconds. Date-formatted values are ignored."""
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return None
+
+
+async def _sleep_retry_after(headers, default: float = 2.0) -> float:
+    """Sleep for Retry-After (capped at 30s) so 429s do not stall the tool."""
+    wait = _retry_after_seconds(headers)
+    if wait is None:
+        wait = default
+    wait = min(wait, 30.0)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    return wait
 
 
 class TTLCache:
@@ -182,6 +297,8 @@ class DuckDuckGoSearcher:
         default_region: str = "",
         backend: str = "auto",
         ssl_verify=True,
+        requests_per_minute: int = 30,
+        rate_limit_strategy: str = "sliding",
     ):
         """
         Initialize DuckDuckGo searcher
@@ -197,12 +314,15 @@ class DuckDuckGoSearcher:
             ssl_verify: TLS verification passed to the HTTP clients: True (default
                 trust store), a path to a CA bundle (e.g. a TLS-intercepting proxy's
                 CA), or False to disable verification.
+            requests_per_minute: Search rate-limit cap (default 30).
+            rate_limit_strategy: "sliding" (default) or "token_bucket".
         """
         if backend not in SUPPORTED_FETCH_BACKENDS:
             raise ValueError(
                 f"Unknown search backend '{backend}'. Supported: {SUPPORTED_FETCH_BACKENDS}"
             )
-        self.rate_limiter = RateLimiter()
+        self.rate_limiter = make_rate_limiter(rate_limit_strategy, requests_per_minute)
+        self.rate_limit_strategy = rate_limit_strategy
         self.safe_search = safe_search
         self.default_region = default_region
         self.backend = backend
@@ -382,6 +502,11 @@ class DuckDuckGoSearcher:
             response = await client.post(
                 self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
             )
+            if response.status_code == 429:
+                await _sleep_retry_after(response.headers)
+                response = await client.post(
+                    self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
+                )
             response.raise_for_status()
             return response.status_code, response.text
 
@@ -398,6 +523,9 @@ class DuckDuckGoSearcher:
         # Chrome fingerprint; we only send the search form fields.
         async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
             response = await client.post(self.BASE_URL, data=data, timeout=30.0)
+            if getattr(response, "status_code", None) == 429:
+                await _sleep_retry_after(getattr(response, "headers", None))
+                response = await client.post(self.BASE_URL, data=data, timeout=30.0)
             response.raise_for_status()
             return response.text
 
@@ -540,14 +668,10 @@ def _select_main_root(soup: BeautifulSoup):
         found = soup.select_one(selector)
         if found and len(found.get_text(" ", strip=True)) >= 40:
             return found
-    best = None
-    best_len = 0
-    for el in soup.find_all(["article", "main", "section", "div"]):
-        n = len(el.get_text(" ", strip=True))
-        if n > best_len:
-            best_len = n
-            best = el
-    return best or soup
+    # No recognisable content container. Fall back to <body>: scanning every
+    # block for the most text would be quadratic on large pages and always
+    # picks the outermost wrapper anyway, which is what <body> already is.
+    return soup.body or soup
 
 
 def _safe_markdown_href(href: str) -> Optional[str]:
@@ -666,6 +790,9 @@ class WebContentFetcher:
         backend: str = "httpx",
         allow_private_urls: bool = False,
         ssl_verify=True,
+        requests_per_minute: int = 20,
+        host_requests_per_minute: int = 0,
+        rate_limit_strategy: str = "sliding",
         cache_ttl: float = 300.0,
         cache_max_entries: int = 64,
         parse_mode: str = "text",
@@ -689,6 +816,9 @@ class WebContentFetcher:
             ssl_verify: TLS verification passed to the HTTP clients: True (default
                 trust store), a path to a CA bundle (e.g. a TLS-intercepting proxy's
                 CA), or False to disable verification.
+            requests_per_minute: Global fetch rate-limit cap (default 20).
+            host_requests_per_minute: Optional per-host cap. 0 (default) disables it.
+            rate_limit_strategy: "sliding" (default) or "token_bucket".
             cache_ttl: Seconds to keep a parsed page in memory so paginated
                 ``fetch_content`` calls reuse one download. 0 disables the cache.
             cache_max_entries: LRU cap on cached pages. 0 disables the cache.
@@ -706,7 +836,13 @@ class WebContentFetcher:
         self.default_backend = backend
         self.allow_private_urls = allow_private_urls
         self.ssl_verify = ssl_verify
-        self.rate_limiter = RateLimiter(requests_per_minute=20)
+        self.rate_limit_strategy = rate_limit_strategy
+        self.rate_limiter = make_rate_limiter(rate_limit_strategy, requests_per_minute)
+        self.host_limiter = (
+            HostRateLimiter(rate_limit_strategy, host_requests_per_minute)
+            if host_requests_per_minute > 0
+            else None
+        )
         self.cache = TTLCache(ttl_seconds=cache_ttl, max_entries=cache_max_entries)
         self.default_parse_mode = parse_mode
 
@@ -732,6 +868,15 @@ class WebContentFetcher:
                     },
                     timeout=30.0,
                 )
+                if response.status_code == 429:
+                    await _sleep_retry_after(response.headers)
+                    response = await client.get(
+                        current,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        },
+                        timeout=30.0,
+                    )
                 location = response.headers.get("location")
                 if response.status_code in _REDIRECT_STATUSES and location:
                     current = str(httpx.URL(current).join(location))
@@ -757,6 +902,9 @@ class WebContentFetcher:
             for _ in range(_MAX_REDIRECTS + 1):
                 await self._guard_url(current)
                 response = await client.get(current, allow_redirects=False, timeout=30.0)
+                if getattr(response, "status_code", None) == 429:
+                    await _sleep_retry_after(getattr(response, "headers", None))
+                    response = await client.get(current, allow_redirects=False, timeout=30.0)
                 location = response.headers.get("location")
                 if response.status_code in _REDIRECT_STATUSES and location:
                     current = urllib.parse.urljoin(current, location)
@@ -825,10 +973,15 @@ class WebContentFetcher:
                 if self.cache.enabled
                 else None
             )
+            # A cache hit skips _guard_url on purpose: an entry only exists after
+            # a guarded fetch of the same normalized URL succeeded under this
+            # fetcher's allow_private_urls setting, and no request is made.
             text = self.cache.get(cache_key) if cache_key is not None else None
             cache_hit = text is not None
 
             if not cache_hit:
+                if self.host_limiter is not None:
+                    await self.host_limiter.acquire(url)
                 await self.rate_limiter.acquire()
 
                 await ctx.info(
@@ -869,7 +1022,8 @@ class WebContentFetcher:
                 metadata += f". Use start_index={start_index + max_length} to see more"
             if self.cache.enabled:
                 metadata += f" | cache={cache_note}"
-            metadata += f" | parse={effective_mode}"
+            if effective_mode != "text":
+                metadata += f" | parse={effective_mode}"
             metadata += "]"
             text += metadata
 
@@ -915,8 +1069,8 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_nonneg_int(name: str, default: int) -> int:
-    """Parse a non-negative integer env var, falling back to default on bad input."""
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Parse an integer env var, falling back to default on bad or too-small input."""
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
@@ -925,8 +1079,8 @@ def _env_nonneg_int(name: str, default: int) -> int:
     except ValueError:
         print(f"Warning: Invalid {name} value '{raw}', using {default}", file=sys.stderr)
         return default
-    if value < 0:
-        print(f"Warning: {name} must be >= 0, using {default}", file=sys.stderr)
+    if value < minimum:
+        print(f"Warning: {name} must be >= {minimum}, using {default}", file=sys.stderr)
         return default
     return value
 
@@ -982,8 +1136,12 @@ DISABLE_DNS_REBINDING = _env_flag("DDG_DISABLE_DNS_REBINDING_PROTECTION")
 CA_CERTS = os.getenv("DDG_CA_CERTS", "").strip()
 SSL_VERIFY_ENABLED = os.getenv("DDG_SSL_VERIFY", "1").strip().lower() not in ("0", "false", "no", "off")
 SSL_VERIFY = _resolve_ssl_verify(CA_CERTS, SSL_VERIFY_ENABLED)
-CACHE_TTL = _env_nonneg_int("DDG_CACHE_TTL", 300)
-CACHE_MAX_ENTRIES = _env_nonneg_int("DDG_CACHE_MAX_ENTRIES", 64)
+SEARCH_RPM = _env_int("DDG_SEARCH_RPM", 30, minimum=1)
+FETCH_RPM = _env_int("DDG_FETCH_RPM", 20, minimum=1)
+FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 0, minimum=0)
+RATE_LIMIT_STRATEGY = os.getenv("DDG_RATE_LIMIT_STRATEGY", "sliding").strip().lower() or "sliding"
+CACHE_TTL = _env_int("DDG_CACHE_TTL", 300, minimum=0)
+CACHE_MAX_ENTRIES = _env_int("DDG_CACHE_MAX_ENTRIES", 64, minimum=0)
 PARSE_MODE = os.getenv("DDG_PARSE_MODE", "text").strip().lower() or "text"
 
 if CA_CERTS and not os.path.isfile(CA_CERTS):
@@ -1001,16 +1159,31 @@ if SEARCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
     print(f"Warning: Invalid DDG_SEARCH_BACKEND value '{SEARCH_BACKEND}', using auto", file=sys.stderr)
     SEARCH_BACKEND = "auto"
 
+if RATE_LIMIT_STRATEGY not in SUPPORTED_RATE_STRATEGIES:
+    print(
+        f"Warning: Invalid DDG_RATE_LIMIT_STRATEGY value '{RATE_LIMIT_STRATEGY}', using sliding",
+        file=sys.stderr,
+    )
+    RATE_LIMIT_STRATEGY = "sliding"
+
 if PARSE_MODE not in SUPPORTED_PARSE_MODES:
     print(f"Warning: Invalid DDG_PARSE_MODE value '{PARSE_MODE}', using text", file=sys.stderr)
     PARSE_MODE = "text"
 
 searcher = DuckDuckGoSearcher(
-    safe_search=safe_search, default_region=REGION_CODE, backend=SEARCH_BACKEND, ssl_verify=SSL_VERIFY
+    safe_search=safe_search,
+    default_region=REGION_CODE,
+    backend=SEARCH_BACKEND,
+    ssl_verify=SSL_VERIFY,
+    requests_per_minute=SEARCH_RPM,
+    rate_limit_strategy=RATE_LIMIT_STRATEGY,
 )
 fetcher = WebContentFetcher(
     allow_private_urls=ALLOW_PRIVATE_URLS,
     ssl_verify=SSL_VERIFY,
+    requests_per_minute=FETCH_RPM,
+    host_requests_per_minute=FETCH_HOST_RPM,
+    rate_limit_strategy=RATE_LIMIT_STRATEGY,
     cache_ttl=CACHE_TTL,
     cache_max_entries=CACHE_MAX_ENTRIES,
     parse_mode=PARSE_MODE,
@@ -1020,6 +1193,11 @@ print("DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
 print(f"  Search backend: {searcher.backend}", file=sys.stderr)
+print(
+    f"  Rate limit: strategy={RATE_LIMIT_STRATEGY} search={SEARCH_RPM}/min "
+    f"fetch={FETCH_RPM}/min host={FETCH_HOST_RPM}/min",
+    file=sys.stderr,
+)
 print(f"  Content cache: ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES}", file=sys.stderr)
 print(f"  Parse mode: {PARSE_MODE}", file=sys.stderr)
 if SSL_VERIFY is not True:
@@ -1144,6 +1322,39 @@ def main():
         ),
     )
     parser.add_argument(
+        "--rate-limit-strategy",
+        choices=list(SUPPORTED_RATE_STRATEGIES),
+        default=None,
+        help=(
+            "Rate-limit algorithm: 'sliding' (default, historical 60s window) or "
+            "'token_bucket' (burst then smooth). Also DDG_RATE_LIMIT_STRATEGY."
+        ),
+    )
+    parser.add_argument(
+        "--search-rpm",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Search requests per minute (default: 30, or DDG_SEARCH_RPM).",
+    )
+    parser.add_argument(
+        "--fetch-rpm",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Global fetch_content requests per minute (default: 20, or DDG_FETCH_RPM).",
+    )
+    parser.add_argument(
+        "--fetch-host-rpm",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Optional per-host fetch_content cap so one site cannot use the whole "
+            "fetch budget (default: 0, off; or DDG_FETCH_HOST_RPM)."
+        ),
+    )
+    parser.add_argument(
         "--cache-ttl",
         type=int,
         default=None,
@@ -1232,6 +1443,13 @@ def main():
     if args.ca_certs is not None and not os.path.isfile(args.ca_certs):
         parser.error(f"--ca-certs path '{args.ca_certs}' does not exist")
 
+    if args.search_rpm is not None and args.search_rpm < 1:
+        parser.error("--search-rpm must be >= 1")
+    if args.fetch_rpm is not None and args.fetch_rpm < 1:
+        parser.error("--fetch-rpm must be >= 1")
+    if args.fetch_host_rpm is not None and args.fetch_host_rpm < 0:
+        parser.error("--fetch-host-rpm must be >= 0")
+
     if args.cache_ttl is not None and args.cache_ttl < 0:
         parser.error("--cache-ttl must be >= 0")
     if args.cache_max_entries is not None and args.cache_max_entries < 0:
@@ -1240,6 +1458,10 @@ def main():
     # CLI flags override the env-derived SSL settings.
     ca_certs = args.ca_certs if args.ca_certs is not None else CA_CERTS
     ssl_verify = _resolve_ssl_verify(ca_certs, SSL_VERIFY_ENABLED and not args.no_ssl_verify)
+    rate_strategy = args.rate_limit_strategy or RATE_LIMIT_STRATEGY
+    search_rpm = args.search_rpm if args.search_rpm is not None else SEARCH_RPM
+    fetch_rpm = args.fetch_rpm if args.fetch_rpm is not None else FETCH_RPM
+    fetch_host_rpm = args.fetch_host_rpm if args.fetch_host_rpm is not None else FETCH_HOST_RPM
     cache_ttl = args.cache_ttl if args.cache_ttl is not None else CACHE_TTL
     cache_max_entries = (
         args.cache_max_entries if args.cache_max_entries is not None else CACHE_MAX_ENTRIES
@@ -1253,12 +1475,20 @@ def main():
         backend=args.fetch_backend,
         allow_private_urls=allow_private,
         ssl_verify=ssl_verify,
+        requests_per_minute=fetch_rpm,
+        host_requests_per_minute=fetch_host_rpm,
+        rate_limit_strategy=rate_strategy,
         cache_ttl=cache_ttl,
         cache_max_entries=cache_max_entries,
         parse_mode=parse_mode,
     )
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
     print(f"  Allow private URLs: {fetcher.allow_private_urls}", file=sys.stderr)
+    print(
+        f"  Rate limit: strategy={rate_strategy} search={search_rpm}/min "
+        f"fetch={fetch_rpm}/min host={fetch_host_rpm}/min",
+        file=sys.stderr,
+    )
     print(
         f"  Content cache: ttl={cache_ttl}s max_entries={cache_max_entries}",
         file=sys.stderr,
@@ -1267,14 +1497,22 @@ def main():
     if ssl_verify is not True:
         print(f"  SSL verify: {ssl_verify}", file=sys.stderr)
 
-    # Reconfigure the module-level searcher if a backend or SSL setting was given on
-    # the CLI (otherwise it keeps the env-derived defaults).
-    if args.search_backend is not None or ssl_verify != searcher.ssl_verify:
+    # Reconfigure the module-level searcher if a backend, SSL, or rate-limit
+    # setting was given on the CLI (otherwise it keeps the env-derived defaults).
+    rebuild_searcher = (
+        args.search_backend is not None
+        or ssl_verify != searcher.ssl_verify
+        or args.search_rpm is not None
+        or args.rate_limit_strategy is not None
+    )
+    if rebuild_searcher:
         searcher = DuckDuckGoSearcher(
             safe_search=safe_search,
             default_region=REGION_CODE,
             backend=args.search_backend or searcher.backend,
             ssl_verify=ssl_verify,
+            requests_per_minute=search_rpm,
+            rate_limit_strategy=rate_strategy,
         )
         print(f"  Search backend: {searcher.backend}", file=sys.stderr)
 
