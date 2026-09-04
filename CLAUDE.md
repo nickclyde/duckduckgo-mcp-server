@@ -45,8 +45,9 @@ uv run --with pip-audit pip-audit --desc
 Single-module server in `src/duckduckgo_mcp_server/server.py` with three main classes:
 
 - **`DuckDuckGoSearcher`** — Scrapes DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html`) via POST requests. Parses results with BeautifulSoup. Handles SafeSearch (`kp` param) and region (`kl` param) configuration.
-- **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer), and returns cleaned text truncated to 8000 chars.
-- **`RateLimiter`** — Sliding-window rate limiter (30 req/min for search, 20 req/min for content fetching).
+- **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer), and returns cleaned text truncated to 8000 chars. Parsed pages are kept in an in-memory `TTLCache` so pagination does not re-download.
+- **`RateLimiter`** — Sliding-window rate limiter (30 req/min for search, 20 req/min for content fetching). Cache hits skip the fetch limiter.
+- **`TTLCache`** — TTL + LRU cache used by `fetch_content`. Disabled when TTL or max entries is 0.
 
 Two MCP tools are exposed: `search` and `fetch_content`.
 
@@ -59,6 +60,7 @@ Environment variables read at startup (not per-request):
 - `DDG_SEARCH_BACKEND`: `auto` (default) | `httpx` | `curl` — HTTP backend for the search tool. `auto` falls back to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a fingerprint block (HTTP 202/403); `curl`/fallback need the `[browser]` extra. Also settable via `--search-backend`.
 - `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
 - `DDG_CA_CERTS`: path to a PEM CA bundle for verifying TLS on outbound requests (needed behind TLS-intercepting proxies — httpx no longer reads `SSL_CERT_FILE`). `DDG_SSL_VERIFY=0` disables verification entirely (discouraged). Also `--ca-certs` / `--no-ssl-verify`. Applies to all four client sites (httpx + curl_cffi, search + fetch).
+- `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES`: in-memory `fetch_content` cache (default 300s / 64 entries). `0` disables. Also `--cache-ttl` / `--cache-max-entries`.
 
 ## Testing
 

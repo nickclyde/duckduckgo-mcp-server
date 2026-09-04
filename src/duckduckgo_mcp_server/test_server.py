@@ -1,7 +1,9 @@
 import asyncio
+import os
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -15,6 +17,7 @@ from duckduckgo_mcp_server.server import _build_transport_security
 
 from duckduckgo_mcp_server.server import (
     RateLimiter,
+    TTLCache,
     DuckDuckGoSearcher,
     SafeSearchMode,
     SearchResult,
@@ -24,6 +27,10 @@ from duckduckgo_mcp_server.server import (
     _validate_public_url,
     _is_search_block,
     _resolve_ssl_verify,
+    _normalize_cache_url,
+    _content_cache_key,
+    _html_to_text,
+    _env_nonneg_int,
 )
 
 try:
@@ -76,6 +83,89 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             asyncio.run(limiter.acquire())
             mock_sleep.assert_not_called()
+
+
+class TestTTLCache(unittest.TestCase):
+    def test_get_returns_none_when_empty(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=8)
+        self.assertIsNone(cache.get("missing"))
+
+    def test_round_trip(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=8)
+        cache.set("k", "v")
+        self.assertEqual(cache.get("k"), "v")
+
+    def test_expired_entry_is_a_miss(self):
+        cache = TTLCache(ttl_seconds=10, max_entries=8)
+        cache.set("k", "v")
+        with patch("duckduckgo_mcp_server.server.time.monotonic", return_value=time.monotonic() + 11):
+            self.assertIsNone(cache.get("k"))
+        self.assertEqual(len(cache), 0)
+
+    def test_zero_ttl_disables_cache(self):
+        cache = TTLCache(ttl_seconds=0, max_entries=8)
+        self.assertFalse(cache.enabled)
+        cache.set("k", "v")
+        self.assertIsNone(cache.get("k"))
+
+    def test_zero_max_entries_disables_cache(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=0)
+        self.assertFalse(cache.enabled)
+        cache.set("k", "v")
+        self.assertIsNone(cache.get("k"))
+
+    def test_lru_evicts_oldest(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=2)
+        cache.set("a", 1)
+        cache.set("b", 2)
+        cache.set("c", 3)
+        self.assertIsNone(cache.get("a"))
+        self.assertEqual(cache.get("b"), 2)
+        self.assertEqual(cache.get("c"), 3)
+
+    def test_get_refreshes_lru_order(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=2)
+        cache.set("a", 1)
+        cache.set("b", 2)
+        self.assertEqual(cache.get("a"), 1)  # a becomes most recently used
+        cache.set("c", 3)
+        self.assertEqual(cache.get("a"), 1)
+        self.assertIsNone(cache.get("b"))
+        self.assertEqual(cache.get("c"), 3)
+
+    def test_normalize_cache_url_drops_fragment_and_default_port(self):
+        self.assertEqual(
+            _normalize_cache_url("HTTPS://Example.COM:443/path#frag"),
+            "https://example.com/path",
+        )
+        self.assertEqual(
+            _normalize_cache_url("http://example.com:8080/x?q=1"),
+            "http://example.com:8080/x?q=1",
+        )
+
+    def test_content_cache_key_includes_backend_and_parse_mode(self):
+        key = _content_cache_key("https://Example.com/a#x", "httpx")
+        self.assertEqual(key, ("https://example.com/a", "httpx", "text"))
+
+    def test_html_to_text_strips_chrome(self):
+        html = (
+            "<html><body><nav>Nav</nav><h1>Title</h1>"
+            "<script>alert(1)</script><p>Body</p><footer>Foot</footer></body></html>"
+        )
+        text = _html_to_text(html)
+        self.assertIn("Title", text)
+        self.assertIn("Body", text)
+        self.assertNotIn("Nav", text)
+        self.assertNotIn("alert", text)
+        self.assertNotIn("Foot", text)
+
+    def test_env_nonneg_int_defaults_on_bad_input(self):
+        with patch.dict(os.environ, {"DDG_CACHE_TTL": "nope"}, clear=False):
+            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 300)
+        with patch.dict(os.environ, {"DDG_CACHE_TTL": "-5"}, clear=False):
+            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 300)
+        with patch.dict(os.environ, {"DDG_CACHE_TTL": "12"}, clear=False):
+            self.assertEqual(_env_nonneg_int("DDG_CACHE_TTL", 300), 12)
 
 
 class TestDuckDuckGoSearcher(unittest.TestCase):
@@ -477,6 +567,100 @@ class TestWebContentFetcher(unittest.TestCase):
             stop()
 
 
+class TestWebContentFetcherCache(unittest.TestCase):
+    def test_pagination_reuses_one_download(self):
+        html = "<html><body><p>" + "A" * 100 + "</p></body></html>"
+        fetcher = WebContentFetcher(backend="httpx", allow_private_urls=True)
+        fetch_count = {"n": 0}
+
+        async def fake_httpx(url):
+            fetch_count["n"] += 1
+            return html
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            first = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/page", DummyCtx(), start_index=0, max_length=50)
+            )
+            second = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/page", DummyCtx(), start_index=50, max_length=50)
+            )
+
+        self.assertEqual(fetch_count["n"], 1)
+        self.assertIn("cache=miss", first)
+        self.assertIn("cache=hit", second)
+        self.assertIn("start_index=50 to see more", first)
+        self.assertNotIn("to see more", second)
+
+    def test_disabled_cache_refetches(self):
+        html = "<html><body><p>Hello</p></body></html>"
+        fetcher = WebContentFetcher(
+            backend="httpx", allow_private_urls=True, cache_ttl=0
+        )
+        fetch_count = {"n": 0}
+
+        async def fake_httpx(url):
+            fetch_count["n"] += 1
+            return html
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+
+        self.assertEqual(fetch_count["n"], 2)
+
+    def test_errors_are_not_cached(self):
+        fetcher = WebContentFetcher(backend="httpx", allow_private_urls=True)
+        calls = {"n": 0}
+
+        async def fake_httpx(url):
+            calls["n"] += 1
+            raise httpx.TimeoutException("timed out")
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            first = asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+            second = asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(first.startswith("Error"))
+        self.assertTrue(second.startswith("Error"))
+        self.assertEqual(len(fetcher.cache), 0)
+
+    def test_cache_hit_skips_rate_limiter(self):
+        html = "<html><body><p>Cached</p></body></html>"
+        fetcher = WebContentFetcher(backend="httpx", allow_private_urls=True)
+        limiter_calls = {"n": 0}
+        original_acquire = fetcher.rate_limiter.acquire
+
+        async def counting_acquire():
+            limiter_calls["n"] += 1
+            await original_acquire()
+
+        async def fake_httpx(url):
+            return html
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx), \
+             patch.object(fetcher.rate_limiter, "acquire", side_effect=counting_acquire):
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/page", DummyCtx()))
+
+        self.assertEqual(limiter_calls["n"], 1)
+
+    def test_fragment_does_not_split_cache_entries(self):
+        html = "<html><body><p>Same page</p></body></html>"
+        fetcher = WebContentFetcher(backend="httpx", allow_private_urls=True)
+        fetch_count = {"n": 0}
+
+        async def fake_httpx(url):
+            fetch_count["n"] += 1
+            return html
+
+        with patch.object(fetcher, "_fetch_httpx", side_effect=fake_httpx):
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/a#one", DummyCtx()))
+            asyncio.run(fetcher.fetch_and_parse("https://example.com/a#two", DummyCtx()))
+
+        self.assertEqual(fetch_count["n"], 1)
+
+
 def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=None):
     """Return a context manager that patches the HTTP client for the given backend.
 
@@ -819,6 +1003,21 @@ class TestMainCliArgs(unittest.TestCase):
             duckduckgo_mcp_server.server.main()
             mock_mcp.run.assert_called_once()
         self.assertEqual(duckduckgo_mcp_server.server.fetcher.default_backend, "httpx")
+
+    def test_main_parses_cache_flags(self):
+        with patch.object(
+            sys, "argv", ["duckduckgo-mcp-server", "--cache-ttl", "0", "--cache-max-entries", "3"]
+        ), patch("duckduckgo_mcp_server.server.mcp") as mock_mcp:
+            duckduckgo_mcp_server.server.main()
+            mock_mcp.run.assert_called_once()
+        self.assertFalse(duckduckgo_mcp_server.server.fetcher.cache.enabled)
+        self.assertEqual(duckduckgo_mcp_server.server.fetcher.cache.max_entries, 3)
+
+    def test_main_rejects_negative_cache_ttl(self):
+        with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--cache-ttl", "-1"]), \
+             patch("duckduckgo_mcp_server.server.mcp"):
+            with self.assertRaises(SystemExit):
+                duckduckgo_mcp_server.server.main()
 
     def test_main_parses_search_backend_flag(self):
         with patch.object(sys, "argv", ["duckduckgo-mcp-server", "--search-backend", "curl"]), \

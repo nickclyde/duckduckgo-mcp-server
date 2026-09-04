@@ -79,6 +79,8 @@ Add the following configuration:
   - `wt-wt`: No specific region
   - Leave empty for DuckDuckGo's default behavior
 - `DDG_CA_CERTS`: Path to a PEM CA bundle used to verify TLS certificates on outbound requests (optional). Needed behind TLS-intercepting proxies — see [Running behind a TLS-intercepting proxy](#running-behind-a-tls-intercepting-proxy).
+- `DDG_CACHE_TTL`: Seconds to keep a parsed page in the in-memory `fetch_content` cache (default: `300`). Paginated reads of the same URL reuse one download. Set `0` to disable.
+- `DDG_CACHE_MAX_ENTRIES`: Maximum pages kept in that cache (default: `64`). Least-recently-used eviction. Set `0` to disable.
 
 3. Restart Claude Desktop
 
@@ -270,7 +272,7 @@ Fetches and parses content from a webpage.
 - `backend`: Optional per-call override of the default fetch backend (`"httpx"`, `"curl"`, or `"auto"`). When omitted, uses whatever was set via `--fetch-backend` at server startup.
 
 **Returns:**
-Cleaned and formatted text content from the webpage.
+Cleaned and formatted text content from the webpage. The parsed full page is cached in memory (default 5 minutes) so later pages via `start_index` do not re-download. Metadata includes `cache=hit` or `cache=miss` when the cache is enabled.
 
 > **SSRF protection:** By default `fetch_content` refuses URLs that resolve to
 > loopback, private (RFC1918), link-local (including the `169.254.169.254` cloud
@@ -287,6 +289,15 @@ Cleaned and formatted text content from the webpage.
 - Search: Limited to 30 requests per minute
 - Content Fetching: Limited to 20 requests per minute
 - Automatic queue management and wait times
+- Cache hits on `fetch_content` skip both the download and the fetch rate limiter
+
+### Content cache
+
+- In-memory TTL cache of the fully parsed page (before pagination)
+- Default TTL 300 seconds, 64 entries, least-recently-used eviction
+- Errors are never cached
+- Configure with `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES` or `--cache-ttl` / `--cache-max-entries`
+- Set either value to `0` to disable
 
 ### Result Processing
 
@@ -318,7 +329,6 @@ Cleaned and formatted text content from the webpage.
 Issues and pull requests are welcome! Some areas for potential improvement:
 
 - Enhanced content parsing options
-- Caching layer for frequently accessed content
 - Additional rate limiting strategies
 
 ## License
