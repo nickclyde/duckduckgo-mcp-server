@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -1695,3 +1696,20 @@ class TestConfiguration(unittest.TestCase):
         call_kwargs = mock_client.post.call_args
         post_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
         self.assertEqual(post_data["kl"], "us-en")
+
+
+class TestHealthEndpoint(unittest.TestCase):
+    def test_health_check_returns_ok(self):
+        response = asyncio.run(duckduckgo_mcp_server.server.health_check(MagicMock()))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"status": "ok"})
+
+    def test_health_route_is_registered(self):
+        paths = [
+            route.path
+            for route in duckduckgo_mcp_server.server.mcp.streamable_http_app().routes
+            if isinstance(route, StarletteRoute)
+        ]
+
+        self.assertIn(duckduckgo_mcp_server.server.HEALTH_PATH, paths)

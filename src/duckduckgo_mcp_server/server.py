@@ -1,4 +1,6 @@
 from mcp.server.mcpserver import MCPServer, Context
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 import httpx
 from bs4 import BeautifulSoup, NavigableString
 from typing import List, Optional
@@ -1174,6 +1176,7 @@ mcp = MCPServer("ddg-search")
 # startup banner and the mounted apps cannot drift apart).
 SSE_PATH = "/sse"
 STREAMABLE_HTTP_PATH = "/mcp"
+HEALTH_PATH = "/health"
 
 def _env_flag(name: str) -> bool:
     """True when the named env var is set to a truthy string (1/true/yes/on)."""
@@ -1377,6 +1380,11 @@ async def expand_link(token: str) -> str:
     if url is None:
         return _unknown_ref_error(token)
     return url
+
+
+@mcp.custom_route(HEALTH_PATH, methods=["GET"])
+async def health_check(request: Request) -> Response:
+    return JSONResponse({"status": "ok"})
 
 
 def main():
