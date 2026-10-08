@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grollat/carpool/main/schema/carpool.schema.json",
+  "specVersion": "1",
+  "isolation": "shared",
+  "reason": "Rate limiters and the TTL page cache are lock-protected and only hold public data; sharing one process makes the DuckDuckGo rate limits apply across all sessions on the machine.",
+  "partition": {
+    "env": [
+      "DDG_*"
+    ],
+    "cwd": false
+  },
+  "scaling": {
+    "maxConcurrentRequests": 4,
+    "maxInstances": 2
+  }
+}
