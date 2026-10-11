@@ -1,0 +1,13 @@
+# duckduckgo-mcp-server
+
+> A Model Context Protocol server that provides web search via DuckDuckGo, plus webpage content fetching and parsing, with rate limiting and LLM-friendly output.
+
+Written in Python and installed from PyPI with uv (run via uvx). Designed for MCP clients such as Claude Desktop and Claude Code, with stdio as the default transport and SSE or streamable HTTP options. Provides two tools, search and fetch_content, configurable through environment variables like DDG_SAFE_SEARCH, DDG_REGION, and rate limit settings.
+
+## Docs
+
+- [duckduckgo-mcp-server README](https://raw.githubusercontent.com/nickclyde/duckduckgo-mcp-server/main/README.md): MCP server providing DuckDuckGo web search, content fetching, rate limiting, and Claude Desktop setup instructions.
+- [Features](https://github.com/nickclyde/duckduckgo-mcp-server/blob/main/README.md#features): Web search, content fetching, ref:// URL shortening, rate limiting, error handling, and LLM-friendly output.
+- [Usage](https://github.com/nickclyde/duckduckgo-mcp-server/blob/main/README.md#usage): Running with Claude Desktop, configuration file paths, and environment variables for SafeSearch, region, TLS, and rate limits.
+- [Available Tools](https://github.com/nickclyde/duckduckgo-mcp-server/blob/main/README.md#available-tools): Parameters, region codes, return values, and examples for the search and fetch_content tools.
+- [Features in Detail](https://github.com/nickclyde/duckduckgo-mcp-server/blob/main/README.md#features-in-detail): Rate limiting strategies, content cache settings, result processing, parsing modes, and SafeSearch content safety details.
