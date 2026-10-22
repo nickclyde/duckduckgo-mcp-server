@@ -55,9 +55,11 @@ def local_http_server():
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
-                self.send_header("Content-type", "text/html")
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(html_content.encode("utf-8"))
+
+            do_POST = do_GET
 
             def log_message(self, format, *args):
                 return
@@ -123,6 +125,63 @@ async def test_search_tool_e2e(ddg_html_factory):
             text = result.content[0].text
             assert "E2E Result" in text
             assert "https://e2e.example.com" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "title,snippet,expected_title,expected_snippet",
+    [
+        (
+            "Visiting the <b>Uffizi</b> in Florence",
+            "The <b>Uffizi</b> is open <b>Tuesday</b> to Sunday, 8:15 am to 6:30 pm.",
+            "Visiting the Uffizi in Florence",
+            "The Uffizi is open Tuesday to Sunday, 8:15 am to 6:30 pm.",
+        ),
+        (
+            "The <b>Uffizi</b>, Florence",
+            "<b>Tickets</b>: book ahead.",
+            "The Uffizi, Florence",
+            "Tickets: book ahead.",
+        ),
+        (
+            "Duck<b>Duck</b>Go",
+            "Learn <b>Type</b>Script and C<b>++</b>.",
+            "DuckDuckGo",
+            "Learn TypeScript and C++.",
+        ),
+        (
+            "<b>美术馆</b>开放时间",
+            "周二至<b>周日</b>，8:15 开放。",
+            "美术馆开放时间",
+            "周二至周日，8:15 开放。",
+        ),
+        (
+            "  Uffizi\n\t opening&nbsp;hours  ",
+            "  Open\n\tTuesday&nbsp;to Sunday.  ",
+            "Uffizi opening hours",
+            "Open Tuesday to Sunday.",
+        ),
+    ],
+    ids=["highlighted-words", "punctuation", "partial-words", "chinese", "whitespace"],
+)
+async def test_search_tool_preserves_text_spacing(
+    title, snippet, expected_title, expected_snippet,
+    ddg_html_factory, local_http_server, monkeypatch,
+):
+    html = ddg_html_factory([
+        {"title": title, "href": "https://example.com/museum", "snippet": snippet},
+    ])
+    searcher = ddg_server.DuckDuckGoSearcher(backend="httpx")
+    searcher.BASE_URL = local_http_server(html)
+    monkeypatch.setattr(ddg_server, "searcher", searcher)
+
+    async with Client(mcp_app) as client:
+        result = await client.call_tool("search", {"query": "Uffizi opening hours"})
+        assert not result.is_error
+        text = result.content[0].text
+        assert f"1. {expected_title}\n" in text
+        assert f"   Summary: {expected_snippet}\n" in text
+        assert "   URL: https://example.com/museum\n" in text
 
 
 @pytest.mark.asyncio

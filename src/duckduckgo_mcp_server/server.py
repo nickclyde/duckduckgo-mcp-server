@@ -505,7 +505,7 @@ class DuckDuckGoSearcher:
                 if not link_elem:
                     continue
 
-                title = link_elem.get_text(strip=True)
+                title = " ".join(link_elem.get_text().split())
                 link = link_elem.get("href", "")
 
                 # Skip ad results
@@ -517,7 +517,7 @@ class DuckDuckGoSearcher:
                     link = urllib.parse.unquote(link.split("uddg=")[1].split("&")[0])
 
                 snippet_elem = result.select_one(".result__snippet")
-                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                snippet = " ".join(snippet_elem.get_text().split()) if snippet_elem else ""
 
                 results.append(
                     SearchResult(
